@@ -1,10 +1,75 @@
 import logging
 import os
+import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
 )
+
+# ── GOOGLE SHEETS ────────────────────────────────────────────────
+import gspread
+from google.oauth2.service_account import Credentials
+
+SHEET_ID = "1f61HYd4MQQnBj6z-mWrZ-2arn0r6r9WWbYJ4vphPY1s"
+
+_gsheet = None
+
+def get_sheet():
+    """Повертає з'єднання з Google Таблицею (кешується)."""
+    global _gsheet
+    if _gsheet is None:
+        try:
+            import json
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ]
+            # Спочатку пробуємо змінну середовища з повним JSON (для Railway)
+            creds_json = os.environ.get("GOOGLE_CREDS_JSON")
+            if creds_json:
+                info = json.loads(creds_json)
+                creds = Credentials.from_service_account_info(info, scopes=scopes)
+            else:
+                # Або файл на диску (для локального запуску)
+                creds_file = os.environ.get("GOOGLE_CREDS_FILE", "credentials.json")
+                creds = Credentials.from_service_account_file(creds_file, scopes=scopes)
+            client = gspread.authorize(creds)
+            _gsheet = client.open_by_key(SHEET_ID).sheet1
+        except Exception as e:
+            logging.error(f"Не вдалося підключитись до Google Sheets: {e}")
+            _gsheet = False
+    return _gsheet
+
+def save_to_sheet(answers: dict):
+    """Записує один рядок відповідей у Google Таблицю."""
+    sheet = get_sheet()
+    if not sheet:
+        return
+    try:
+        row = [
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            answers.get("gender", ""),
+            answers.get("grade", ""),
+            answers.get("region", ""),
+            answers.get("city_type", ""),
+            answers.get("city_name", ""),
+            answers.get("district", ""),
+            answers.get("school_type", ""),
+            answers.get("school_name", ""),
+            answers.get("sport_active", ""),
+            answers.get("sport_type", answers.get("sport_why_not", "")),
+            answers.get("esports_know", ""),
+            answers.get("clubJoin", answers.get("club_join", "")),
+            answers.get("clubRole", answers.get("club_role", "")),
+            answers.get("ticket", ""),
+            answers.get("contact_name", ""),
+            answers.get("contact_phone", ""),
+        ]
+        sheet.append_row(row)
+        logging.info("Рядок записано у Google Таблицю")
+    except Exception as e:
+        logging.error(f"Помилка запису у Google Sheets: {e}")
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -586,6 +651,7 @@ async def _finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
     logger.info(f"DONE uid={update.effective_user.id} data={d}")
+    save_to_sheet(d)
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

@@ -2,3 +2,4 @@ python-telegram-bot==20.7
 gspread==6.1.2
 google-auth==2.29.0
 Pillow==10.4.0
+python-barcode==0.15.1

@@ -12,6 +12,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 import io
 from PIL import Image, ImageDraw, ImageFont
+import barcode
+from barcode.writer import ImageWriter
 
 # ── ГЕНЕРАЦІЯ ПАСПОРТА ГРАВЦЯ ────────────────────────────────────
 FONT_DIR = "fonts"
@@ -30,18 +32,43 @@ def _hex_to_rgb(h):
     h = h.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-def _get_initials(name):
-    parts = (name or "").strip().split()
+def _get_initials(first, last):
+    a = first[0].upper() if first else ""
+    b = last[0].upper() if last else ""
+    return (a + b) or "??"
+
+def _split_name(full_name):
+    parts = (full_name or "").strip().split()
     if len(parts) >= 2:
-        return (parts[0][0] + parts[1][0]).upper()
-    return name[:2].upper() if name else "??"
+        return parts[0], " ".join(parts[1:])
+    elif len(parts) == 1:
+        return parts[0], ""
+    return "Гравець", ""
 
 def _passport_font(size, bold=False):
     path = f"{FONT_DIR}/DejaVuSans-Bold.ttf" if bold else f"{FONT_DIR}/DejaVuSans.ttf"
     return ImageFont.truetype(path, size)
 
+def _make_barcode(code_text):
+    writer = ImageWriter()
+    writer.set_options({
+        "module_height": 12.0,
+        "module_width": 0.35,
+        "quiet_zone": 2.0,
+        "font_size": 0,
+        "text_distance": 0,
+        "write_text": False,
+        "background": "white",
+        "foreground": "black",
+    })
+    code = barcode.get("code128", code_text, writer=writer)
+    buf = io.BytesIO()
+    code.write(buf)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
 def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
-    W, H = 900, 560
+    W, H = 900, 620
     img = Image.new("RGB", (W, H), "#ffffff")
     draw = ImageDraw.Draw(img)
 
@@ -52,46 +79,68 @@ def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
     text_rgb = _hex_to_rgb(text_hex)
 
     draw.rounded_rectangle([8, 8, W-8, H-8], radius=24, fill="#ffffff", outline=border_rgb, width=4)
-    pad = 40
+    draw.rounded_rectangle([8, 8, W-8, 64], radius=24, fill=border_rgb)
+    draw.rectangle([8, 44, W-8, 64], fill=border_rgb)
 
-    role_upper = role.upper()
-    badge_font = _passport_font(20, bold=True)
-    bbox = draw.textbbox((0,0), role_upper, font=badge_font)
-    badge_w = (bbox[2]-bbox[0]) + 40
-    draw.rounded_rectangle([pad, pad, pad+badge_w, pad+40], radius=20, fill=bg_rgb)
-    draw.text((pad+20, pad+8), role_upper, font=badge_font, fill=text_rgb)
-
+    club_font = _passport_font(22, bold=True)
+    draw.text((40, 16), "КІБЕРСПОРТИВНИЙ КЛУБ ШКОЛИ", font=club_font, fill="#ffffff")
     num_font = _passport_font(18)
     nb = draw.textbbox((0,0), passport_number, font=num_font)
-    draw.text((W-pad-(nb[2]-nb[0]), pad+10), passport_number, font=num_font, fill=(136,136,136))
+    draw.text((W-40-(nb[2]-nb[0]), 18), passport_number, font=num_font, fill="#ffffff")
 
-    avatar_y = pad + 70
-    avatar_size = 110
+    pad = 40
+    top = 90
+
+    role_upper = role.upper()
+    badge_font = _passport_font(18, bold=True)
+    bbox = draw.textbbox((0,0), role_upper, font=badge_font)
+    badge_w = (bbox[2]-bbox[0]) + 36
+    draw.rounded_rectangle([pad, top, pad+badge_w, top+36], radius=18, fill=bg_rgb)
+    draw.text((pad+18, top+7), role_upper, font=badge_font, fill=text_rgb)
+
+    level = answers.get("player_level", "Новачок")
+    level_font = _passport_font(16, bold=True)
+    level_text = f"РІВЕНЬ: {level.upper()}"
+    lb = draw.textbbox((0,0), level_text, font=level_font)
+    draw.rounded_rectangle([W-pad-(lb[2]-lb[0])-36, top, W-pad, top+36], radius=18,
+                            outline=border_rgb, width=2)
+    draw.text((W-pad-(lb[2]-lb[0])-18, top+7), level_text, font=level_font, fill=border_rgb)
+
+    avatar_y = top + 56
+    avatar_size = 116
+    first_name, last_name = _split_name(answers.get("contact_name", ""))
     draw.ellipse([pad, avatar_y, pad+avatar_size, avatar_y+avatar_size], fill=border_rgb)
-    initials = _get_initials(answers.get("contact_name", "??"))
-    init_font = _passport_font(42, bold=True)
+    initials = _get_initials(first_name, last_name)
+    init_font = _passport_font(44, bold=True)
     ib = draw.textbbox((0,0), initials, font=init_font)
     iw, ih = ib[2]-ib[0], ib[3]-ib[1]
-    draw.text((pad+avatar_size/2-iw/2, avatar_y+avatar_size/2-ih/2-8), initials, font=init_font, fill="#ffffff")
+    draw.text((pad+avatar_size/2-iw/2, avatar_y+avatar_size/2-ih/2-10), initials, font=init_font, fill="#ffffff")
 
-    name_x = pad + avatar_size + 24
-    name = answers.get("contact_name", "Гравець")
-    name_font = _passport_font(32, bold=True)
-    draw.text((name_x, avatar_y+8), name, font=name_font, fill=(34,34,34))
+    info_x = pad + avatar_size + 28
+    info_w = W - pad - info_x
 
-    grade = answers.get("grade", "")
-    school = answers.get("school_name", "")
-    sub_font = _passport_font(20)
-    sub_text = f"{grade} клас" if grade else ""
-    if school:
-        sub_text += f" · {school}" if sub_text else school
-    draw.text((name_x, avatar_y+52), sub_text, font=sub_font, fill=(102,102,102))
+    name_font = _passport_font(30, bold=True)
+    draw.text((info_x, avatar_y - 4), f"{last_name} {first_name}".strip(), font=name_font, fill=(30,30,30))
 
-    line_y = avatar_y + avatar_size + 30
+    row_font = _passport_font(18)
+    label_font = _passport_font(14)
+    row_y = avatar_y + 44
+
+    school = answers.get("school_name", "—")
+    grade = answers.get("grade", "—")
+
+    draw.text((info_x, row_y), "ШКОЛА", font=label_font, fill=(153,153,153))
+    draw.text((info_x, row_y+18), school, font=row_font, fill=(51,51,51))
+
+    col2_x = info_x + info_w * 0.62
+    draw.text((col2_x, row_y), "КЛАС", font=label_font, fill=(153,153,153))
+    draw.text((col2_x, row_y+18), f"{grade}" if grade else "—", font=row_font, fill=(51,51,51))
+
+    line_y = avatar_y + avatar_size + 26
     draw.line([pad, line_y, W-pad, line_y], fill=(230,230,225), width=2)
 
-    stat_font = _passport_font(20)
-    stat_label_font = _passport_font(16)
+    stat_font = _passport_font(19)
+    stat_label_font = _passport_font(15)
     stats = []
 
     esports = answers.get("esports_know", "")
@@ -114,17 +163,23 @@ def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
         if games:
             stats.append(("Ігри", ", ".join(games[:3])))
 
-    y = line_y + 24
-    for label, value in stats[:4]:
-        draw.text((pad, y), label, font=stat_label_font, fill=(136,136,136))
+    y = line_y + 20
+    for label, value in stats[:3]:
+        draw.text((pad, y), label, font=stat_label_font, fill=(153,153,153))
         vb = draw.textbbox((0,0), str(value), font=stat_font)
-        draw.text((W-pad-(vb[2]-vb[0]), y-2), str(value), font=stat_font, fill=(51,51,51))
-        y += 34
+        draw.text((W-pad-(vb[2]-vb[0]), y-3), str(value), font=stat_font, fill=(51,51,51))
+        y += 32
 
-    footer_font = _passport_font(15)
-    footer_text = "esul_underground_bot · Виданий кiберспортивним клубом школи"
-    fb = draw.textbbox((0,0), footer_text, font=footer_font)
-    draw.text((W/2-(fb[2]-fb[0])/2, H-50), footer_text, font=footer_font, fill=(153,153,153))
+    barcode_img = _make_barcode(passport_number.replace(" ", ""))
+    bc_target_w = W - 2*pad
+    bc_ratio = barcode_img.height / barcode_img.width
+    bc_h = int(bc_target_w * bc_ratio)
+    bc_h = min(bc_h, 90)
+    bc_w = int(bc_h / bc_ratio)
+    barcode_img = barcode_img.resize((bc_w, bc_h))
+    bc_x = (W - bc_w) // 2
+    bc_y = H - bc_h - 30
+    img.paste(barcode_img, (bc_x, bc_y))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -775,6 +830,7 @@ async def _finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not passport_data.get("contact_name"):
             tg_user = update.effective_user
             passport_data["contact_name"] = f"{tg_user.first_name or ''} {tg_user.last_name or ''}".strip() or "Гравець"
+        passport_data["player_level"] = "Новачок"
         passport_number = f"KS-2026-{update.effective_user.id % 10000:04d}"
         photo_buf = generate_passport(passport_data, passport_number)
         await update.message.reply_photo(

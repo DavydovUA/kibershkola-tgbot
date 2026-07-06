@@ -10,6 +10,126 @@ from telegram.ext import (
 # ── GOOGLE SHEETS ────────────────────────────────────────────────
 import gspread
 from google.oauth2.service_account import Credentials
+import io
+from PIL import Image, ImageDraw, ImageFont
+
+# ── ГЕНЕРАЦІЯ ПАСПОРТА ГРАВЦЯ ────────────────────────────────────
+FONT_DIR = "fonts"
+
+ROLE_COLORS = {
+    "Гравець": ("#E1F5EE", "#0F6E56", "#085041"),
+    "Стример / коментатор": ("#EEEDFE", "#534AB7", "#3C3489"),
+    "Організатор турнірів": ("#FAEEDA", "#854F0B", "#633806"),
+    "Контент-мейкер": ("#FBEAF0", "#993556", "#72243E"),
+    "Суддя / рефері": ("#FAECE7", "#993C1D", "#712B13"),
+    "Спостерігач": ("#F1EFE8", "#5F5E5A", "#444441"),
+}
+DEFAULT_PASSPORT_COLOR = ("#E6F1FB", "#185FA5", "#0C447C")
+
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+def _get_initials(name):
+    parts = (name or "").strip().split()
+    if len(parts) >= 2:
+        return (parts[0][0] + parts[1][0]).upper()
+    return name[:2].upper() if name else "??"
+
+def _passport_font(size, bold=False):
+    path = f"{FONT_DIR}/DejaVuSans-Bold.ttf" if bold else f"{FONT_DIR}/DejaVuSans.ttf"
+    return ImageFont.truetype(path, size)
+
+def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
+    W, H = 900, 560
+    img = Image.new("RGB", (W, H), "#ffffff")
+    draw = ImageDraw.Draw(img)
+
+    role = answers.get("club_role") or "Гравець"
+    bg_hex, border_hex, text_hex = ROLE_COLORS.get(role, DEFAULT_PASSPORT_COLOR)
+    border_rgb = _hex_to_rgb(border_hex)
+    bg_rgb = _hex_to_rgb(bg_hex)
+    text_rgb = _hex_to_rgb(text_hex)
+
+    draw.rounded_rectangle([8, 8, W-8, H-8], radius=24, fill="#ffffff", outline=border_rgb, width=4)
+    pad = 40
+
+    role_upper = role.upper()
+    badge_font = _passport_font(20, bold=True)
+    bbox = draw.textbbox((0,0), role_upper, font=badge_font)
+    badge_w = (bbox[2]-bbox[0]) + 40
+    draw.rounded_rectangle([pad, pad, pad+badge_w, pad+40], radius=20, fill=bg_rgb)
+    draw.text((pad+20, pad+8), role_upper, font=badge_font, fill=text_rgb)
+
+    num_font = _passport_font(18)
+    nb = draw.textbbox((0,0), passport_number, font=num_font)
+    draw.text((W-pad-(nb[2]-nb[0]), pad+10), passport_number, font=num_font, fill=(136,136,136))
+
+    avatar_y = pad + 70
+    avatar_size = 110
+    draw.ellipse([pad, avatar_y, pad+avatar_size, avatar_y+avatar_size], fill=border_rgb)
+    initials = _get_initials(answers.get("contact_name", "??"))
+    init_font = _passport_font(42, bold=True)
+    ib = draw.textbbox((0,0), initials, font=init_font)
+    iw, ih = ib[2]-ib[0], ib[3]-ib[1]
+    draw.text((pad+avatar_size/2-iw/2, avatar_y+avatar_size/2-ih/2-8), initials, font=init_font, fill="#ffffff")
+
+    name_x = pad + avatar_size + 24
+    name = answers.get("contact_name", "Гравець")
+    name_font = _passport_font(32, bold=True)
+    draw.text((name_x, avatar_y+8), name, font=name_font, fill=(34,34,34))
+
+    grade = answers.get("grade", "")
+    school = answers.get("school_name", "")
+    sub_font = _passport_font(20)
+    sub_text = f"{grade} клас" if grade else ""
+    if school:
+        sub_text += f" · {school}" if sub_text else school
+    draw.text((name_x, avatar_y+52), sub_text, font=sub_font, fill=(102,102,102))
+
+    line_y = avatar_y + avatar_size + 30
+    draw.line([pad, line_y, W-pad, line_y], fill=(230,230,225), width=2)
+
+    stat_font = _passport_font(20)
+    stat_label_font = _passport_font(16)
+    stats = []
+
+    esports = answers.get("esports_know", "")
+    if esports:
+        stats.append(("Кіберспорт", esports))
+    club_join = answers.get("club_join", "")
+    if club_join:
+        stats.append(("Хоче до клубу", club_join))
+    sport_active = answers.get("sport_active", "")
+    if sport_active and sport_active != "Ні":
+        stats.append(("Спорт", answers.get("sport_type", sport_active)))
+    if answers.get("mobile_play") == "Так":
+        games = []
+        for g, label in [("game_brawl","Brawl Stars"),("game_roblox","Roblox"),
+                          ("game_minecraft","Minecraft"),("game_clash","Clash Royale"),
+                          ("game_hok","Honor of Kings"),("game_mlbb","MLBB"),
+                          ("game_pubg","PUBG Mobile")]:
+            if answers.get(g) == "Так":
+                games.append(label)
+        if games:
+            stats.append(("Ігри", ", ".join(games[:3])))
+
+    y = line_y + 24
+    for label, value in stats[:4]:
+        draw.text((pad, y), label, font=stat_label_font, fill=(136,136,136))
+        vb = draw.textbbox((0,0), str(value), font=stat_font)
+        draw.text((W-pad-(vb[2]-vb[0]), y-2), str(value), font=stat_font, fill=(51,51,51))
+        y += 34
+
+    footer_font = _passport_font(15)
+    footer_text = "esul_underground_bot · Виданий кiберспортивним клубом школи"
+    fb = draw.textbbox((0,0), footer_text, font=footer_font)
+    draw.text((W/2-(fb[2]-fb[0])/2, H-50), footer_text, font=footer_font, fill=(153,153,153))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
 
 SHEET_ID = "1f61HYd4MQQnBj6z-mWrZ-2arn0r6r9WWbYJ4vphPY1s"
 
@@ -25,13 +145,11 @@ def get_sheet():
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
             ]
-            # Спочатку пробуємо змінну середовища з повним JSON (для Railway)
             creds_json = os.environ.get("GOOGLE_CREDS_JSON")
             if creds_json:
                 info = json.loads(creds_json)
                 creds = Credentials.from_service_account_info(info, scopes=scopes)
             else:
-                # Або файл на диску (для локального запуску)
                 creds_file = os.environ.get("GOOGLE_CREDS_FILE", "credentials.json")
                 creds = Credentials.from_service_account_file(creds_file, scopes=scopes)
             client = gspread.authorize(creds)
@@ -650,6 +768,23 @@ async def _finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "💙 Пам'ятай: якщо потрібна допомога — *116 111* (безкоштовно, анонімно)",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
+
+    # Генеруємо і надсилаємо паспорт гравця
+    try:
+        passport_data = dict(d)
+        if not passport_data.get("contact_name"):
+            tg_user = update.effective_user
+            passport_data["contact_name"] = f"{tg_user.first_name or ''} {tg_user.last_name or ''}".strip() or "Гравець"
+        passport_number = f"KS-2026-{update.effective_user.id % 10000:04d}"
+        photo_buf = generate_passport(passport_data, passport_number)
+        await update.message.reply_photo(
+            photo=photo_buf,
+            caption=f"🎫 *Твій паспорт гравця* {passport_number}\n\nЗбережи собі на телефон!",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Не вдалося згенерувати паспорт: {e}")
+
     logger.info(f"DONE uid={update.effective_user.id} data={d}")
     save_to_sheet(d)
     return ConversationHandler.END

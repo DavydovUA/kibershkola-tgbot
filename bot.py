@@ -1,11 +1,69 @@
 import logging
 import os
 import datetime
+import httpx
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
 )
+
+# ── NOVA POSHTA API — ЖИВИЙ ПОШУК НАСЕЛЕНИХ ПУНКТІВ ─────────────
+NOVA_POSHTA_API_KEY = os.environ.get("NOVA_POSHTA_API_KEY", "")
+NOVA_POSHTA_URL = "https://api.novaposhta.ua/v2.0/json/"
+
+async def search_settlements(query: str, oblast: str, limit: int = 8):
+    """Шукає населені пункти через API Нової Пошти, фільтрує за областю."""
+    query = query.strip()
+    if not NOVA_POSHTA_API_KEY or len(query) < 2:
+        return []
+    payload = {
+        "apiKey": NOVA_POSHTA_API_KEY,
+        "modelName": "Address",
+        "calledMethod": "getCities",
+        "methodProperties": {"FindByString": query, "Limit": "40"}
+    }
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.post(NOVA_POSHTA_URL, json=payload)
+            data = resp.json()
+        if not data.get("success"):
+            return []
+        items = data.get("data", [])
+        oblast_key = oblast.replace("область", "").replace("м.", "").strip().lower()
+        results, seen = [], set()
+        for it in items:
+            name = it.get("Description", "")
+            area = (it.get("AreaDescription", "") or "").lower()
+            if not name or name in seen:
+                continue
+            if oblast_key and oblast_key not in area:
+                continue
+            seen.add(name)
+            results.append(name)
+            if len(results) >= limit:
+                break
+        return results
+    except Exception as e:
+        logging.error(f"Nova Poshta API error: {e}")
+        return []
+
+# ── РАЙОНИ ВЕЛИКИХ МІСТ (офіційний адміністративний поділ) ──────
+MAJOR_CITY_DISTRICTS = {
+    "Київ": ["Голосіївський","Дарницький","Деснянський","Дніпровський","Оболонський",
+             "Печерський","Подільський","Святошинський","Солом'янський","Шевченківський"],
+    "Харків": ["Основ'янський","Київський","Слобідський","Шевченківський","Немишлянський",
+               "Новобаварський","Холодногірський","Індустріальний","Салтівський"],
+    "Одеса": ["Приморський","Київський","Малиновський","Суворовський"],
+    "Дніпро": ["Амур-Нижньодніпровський","Індустріальний","Новокодацький","Соборний",
+               "Центральний","Чечелівський","Шевченківський"],
+    "Львів": ["Галицький","Залізничний","Личаківський","Сихівський","Франківський","Шевченківський"],
+    "Запоріжжя": ["Заводський","Комунарський","Олександрівський","Орджонікідзевський",
+                  "Шевченківський","Дніпровський","Вознесенівський"],
+    "Миколаїв": ["Заводський","Інгульський","Корабельний","Центральний"],
+    "Кривий Ріг": ["Дзержинський","Довгинцівський","Інгулецький","Металургійний",
+                   "Покровський","Саксаганський","Тернівський"],
+}
 
 # ── GOOGLE SHEETS ────────────────────────────────────────────────
 import gspread
@@ -237,6 +295,7 @@ def save_to_sheet(answers: dict):
             answers.get("clubRole", answers.get("club_role", "")),
             answers.get("ticket", ""),
             answers.get("contact_name", ""),
+            answers.get("parent_name", ""),
             answers.get("contact_phone", ""),
         ]
         sheet.append_row(row)
@@ -250,8 +309,8 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("BOT_TOKEN")
 
 (
-    CONSENT, GENDER, GRADE,
-    REGION, CITY_TYPE, CITY_NAME, DISTRICT, SCHOOL_TYPE, SCHOOL_NAME,
+    CONSENT, GENDER, REGION, FULL_NAME, GRADE, GRADE_LETTER,
+    CITY_TYPE, CITY_SELECT, CITY_NAME, DISTRICT, SCHOOL_TYPE, SCHOOL_NAME,
     SPORT_ACTIVE, SPORT_TYPE, SPORT_LEVEL, SPORT_COACH,
     SPORT_WHY_NOT, SPORT_WOULD_LIKE,
     WATCH_SPORT, WATCH_WHERE, FAV_SPORT_WATCH, PHYS_ED, PHYS_OUT,
@@ -267,16 +326,57 @@ TOKEN = os.environ.get("BOT_TOKEN")
     TOXIC, RESPECT_RULE, SAFE_FEEL,
     CLUB_JOIN, CLUB_ROLE, CLUB_IMPORTANT, PARENTS_SUPPORT, PARENTS_ALLOW,
     FUTURE, FUTURE_ROLE,
-    TICKET, CONTACT_NAME, CONTACT_PHONE, CONTACT_TIME,
-) = range(70)
+    TICKET, PARENT_NAME, CONTACT_PHONE, CONTACT_TIME,
+) = range(73)
+
+# ── ДАНІ ПРО ОБЛАСТІ: ЦЕНТРИ ТА ВЕЛИКІ МІСТА ────────────────────
+OBLAST_CENTERS = {
+    "Вінницька": "Вінниця", "Волинська": "Луцьк", "Дніпропетровська": "Дніпро",
+    "Донецька": "Донецьк", "Житомирська": "Житомир", "Закарпатська": "Ужгород",
+    "Запорізька": "Запоріжжя", "Івано-Франківська": "Івано-Франківськ",
+    "Київська": "Київ", "Кіровоградська": "Кропивницький", "Луганська": "Луганськ",
+    "Львівська": "Львів", "Миколаївська": "Миколаїв", "Одеська": "Одеса",
+    "Полтавська": "Полтава", "Рівненська": "Рівне", "Сумська": "Суми",
+    "Тернопільська": "Тернопіль", "Харківська": "Харків", "Херсонська": "Херсон",
+    "Хмельницька": "Хмельницький", "Черкаська": "Черкаси", "Чернівецька": "Чернівці",
+    "Чернігівська": "Чернігів", "м. Київ": "Київ",
+}
+
+OBLAST_CITIES = {
+    "Вінницька": ["Жмеринка", "Могилів-Подільський", "Козятин", "Ладижин"],
+    "Волинська": ["Ковель", "Володимир", "Нововолинськ", "Камінь-Каширський"],
+    "Дніпропетровська": ["Кривий Ріг", "Кам'янське", "Нікополь", "Павлоград"],
+    "Донецька": ["Маріуполь", "Краматорськ", "Слов'янськ", "Бахмут"],
+    "Житомирська": ["Бердичів", "Новоград-Волинський", "Коростень"],
+    "Закарпатська": ["Мукачево", "Хуст", "Берегове", "Виноградів"],
+    "Запорізька": ["Мелітополь", "Бердянськ", "Енергодар"],
+    "Івано-Франківська": ["Калуш", "Коломия", "Надвірна"],
+    "Київська": ["Біла Церква", "Бровари", "Бориспіль", "Ірпінь"],
+    "Кіровоградська": ["Олександрія", "Знам'янка"],
+    "Луганська": ["Сєвєродонецьк", "Лисичанськ", "Рубіжне"],
+    "Львівська": ["Дрогобич", "Червоноград", "Стрий", "Самбір"],
+    "Миколаївська": ["Вознесенськ", "Первомайськ", "Южноукраїнськ"],
+    "Одеська": ["Ізмаїл", "Білгород-Дністровський", "Чорноморськ"],
+    "Полтавська": ["Кременчук", "Горішні Плавні", "Миргород"],
+    "Рівненська": ["Дубно", "Костопіль", "Сарни"],
+    "Сумська": ["Конотоп", "Шостка", "Охтирка"],
+    "Тернопільська": ["Чортків", "Кременець", "Бережани"],
+    "Харківська": ["Лозова", "Ізюм", "Куп'янськ", "Чугуїв"],
+    "Херсонська": ["Нова Каховка", "Каховка", "Скадовськ"],
+    "Хмельницька": ["Кам'янець-Подільський", "Шепетівка", "Нетішин"],
+    "Черкаська": ["Умань", "Сміла", "Золотоноша"],
+    "Чернівецька": ["Новодністровськ", "Хотин", "Кіцмань"],
+    "Чернігівська": ["Ніжин", "Прилуки", "Новгород-Сіверський"],
+    "м. Київ": [],
+}
 
 SUPPORT_TEXT = (
-    "💙 *Важлива інформація*\n\n"
-    "Якщо тебе хтось ображає — в іграх, у школі або вдома — це не норма. Ти не один і не одна.\n\n"
-    "Поговори з тим, кому довіряєш. Або зателефонуй:\n"
+    "💙 *Національна дитяча лінія психологічної підтримки*\n\n"
+    "Це безкоштовна лінія, куди можна зателефонувати, якщо тобі важко, сумно, "
+    "тебе хтось ображає (в іграх, у школі чи вдома), або просто хочеться з кимось поговорити.\n\n"
     "📞 *116 111* — безкоштовно з мобільного\n"
     "📞 *0 800 500 225* — безкоштовно\n\n"
-    "_Анонімно · конфіденційно · психологи завжди поруч._"
+    "_Анонімно · конфіденційно · працює цілодобово._"
 )
 
 def kb(options, cols=2):
@@ -319,16 +419,7 @@ async def consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def gender(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "gender", update.message.text)
     await update.message.reply_text(
-        "*П2. В якому ти класі?*",
-        parse_mode="Markdown",
-        reply_markup=kb(["3","4","5","6","7","8","9","10","11"])
-    )
-    return GRADE
-
-async def grade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    save(ctx, "grade", update.message.text)
-    await update.message.reply_text(
-        "*П3. Яка твоя область?*",
+        "*П2. Яка твоя область?*",
         parse_mode="Markdown",
         reply_markup=kb([
             "Вінницька","Волинська","Дніпропетровська","Донецька",
@@ -345,34 +436,106 @@ async def grade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def region(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "region", update.message.text)
     await update.message.reply_text(
-        "*П4. Тип населеного пункту?*",
+        "*П3. Напиши своє Ім'я та Прізвище повністю українською мовою.*",
+        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
+    )
+    return FULL_NAME
+
+async def full_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    save(ctx, "contact_name", update.message.text)
+    await update.message.reply_text(
+        "*П4. В якому ти класі?*",
         parse_mode="Markdown",
-        reply_markup=kb(["Обласний центр","Місто","Селище / СМТ","Село"])
+        reply_markup=kb(["3","4","5","6","7","8","9","10","11"])
+    )
+    return GRADE
+
+async def grade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    save(ctx, "grade_number", update.message.text)
+    await update.message.reply_text(
+        "*П4б. Буква класу?*",
+        parse_mode="Markdown",
+        reply_markup=kb(["А","Б","В","Г","Немає букви"])
+    )
+    return GRADE_LETTER
+
+async def grade_letter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    letter = update.message.text
+    num = ctx.user_data.get("grade_number", "")
+    if letter and letter != "Немає букви":
+        save(ctx, "grade", f"{num}-{letter}")
+    else:
+        save(ctx, "grade", num)
+    await update.message.reply_text(
+        "*П5. Напиши перші літери назви твого міста, селища або села:*",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
     )
     return CITY_TYPE
 
 async def city_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    save(ctx, "city_type", update.message.text)
-    await update.message.reply_text(
-        "*П5. Назва міста / селища / села?*\n\nНапиши назву:",
-        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
-    )
-    return CITY_NAME
+    query = update.message.text.strip()
+    region_name = ctx.user_data.get("region", "")
+
+    matches = await search_settlements(query, region_name)
+
+    if matches:
+        options = matches + ["Не знайшов — напишу сам"]
+        await update.message.reply_text(
+            "*Обери зі списку або натисни «Не знайшов»:*",
+            parse_mode="Markdown",
+            reply_markup=kb(options, cols=2)
+        )
+        return CITY_SELECT
+    else:
+        await update.message.reply_text(
+            "Нічого не знайшли автоматично. Напиши повну назву населеного пункту сам:",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return CITY_NAME
+
+async def city_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text
+    if val == "Не знайшов — напишу сам":
+        await update.message.reply_text(
+            "Напиши повну назву населеного пункту:",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return CITY_NAME
+    save(ctx, "city_name", val)
+    return await _after_city_selected(update, ctx)
 
 async def city_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "city_name", update.message.text)
-    await update.message.reply_text(
-        "*П5б. Район міста або громада?*\n_(напиши «-» якщо не знаєш)_",
-        parse_mode="Markdown"
-    )
-    return DISTRICT
+    return await _after_city_selected(update, ctx)
+
+async def _after_city_selected(update, ctx):
+    city = ctx.user_data.get("city_name", "")
+    city_clean = city.replace("м.", "").strip()
+
+    if city_clean in MAJOR_CITY_DISTRICTS:
+        await update.message.reply_text(
+            f"*Обери район міста {city_clean}:*",
+            parse_mode="Markdown",
+            reply_markup=kb(MAJOR_CITY_DISTRICTS[city_clean], cols=2)
+        )
+        return DISTRICT
+    else:
+        # Немає офіційних районів — питання пропускається повністю
+        save(ctx, "district", "")
+        await update.message.reply_text(
+            "*П7. Тип школи?*\n_(якщо не впевнений — обери «Не знаю точно»)_",
+            parse_mode="Markdown",
+            reply_markup=kb(["Звичайна школа","Ліцей / гімназія","Не знаю точно"])
+        )
+        return SCHOOL_TYPE
 
 async def district(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "district", update.message.text)
     await update.message.reply_text(
-        "*П6. Тип школи?*",
+        "*П7. Тип школи?*\n_(якщо не впевнений — обери «Не знаю точно»)_",
         parse_mode="Markdown",
-        reply_markup=kb(["Загальноосвітня","Ліцей","Гімназія","НВК","Інший"])
+        reply_markup=kb(["Звичайна школа","Ліцей / гімназія","Не знаю точно"])
     )
     return SCHOOL_TYPE
 
@@ -405,7 +568,7 @@ async def sport_active(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def sport_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "sport_type", update.message.text)
-    await update.message.reply_text("*П10. Рівень участі?*", parse_mode="Markdown",
+    await update.message.reply_text("*П10. Де займаєшся спортом?*", parse_mode="Markdown",
         reply_markup=kb(["Шкільна секція","Спортивний клуб","Міські змагання","Обласні змагання"]))
     return SPORT_LEVEL
 
@@ -458,13 +621,13 @@ async def _ask_phys_ed(update):
 
 async def phys_ed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "phys_ed", update.message.text)
-    await update.message.reply_text("*П15. Фізична активність поза школою?*", parse_mode="Markdown",
+    await update.message.reply_text("*П15. Як часто займаєшся фізичними вправами?*", parse_mode="Markdown",
         reply_markup=kb(["Щодня","Кілька разів на тиждень","Рідко","Майже ніколи"]))
     return PHYS_OUT
 
 async def phys_out(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "phys_out", update.message.text)
-    await update.message.reply_text("💻 *БЛОК: ПК*\n\n*П16. Чи граєш на комп'ютері або ноутбуці?*",
+    await update.message.reply_text("💻 *БЛОК: ПК*\n\n*П16. Чи граєш на комп'ютері або ноутбуці (далі ПК)?*",
         parse_mode="Markdown", reply_markup=kb(["Так","Ні"]))
     return PC_PLAY
 
@@ -496,7 +659,7 @@ async def pc_game(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def pc_compete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "pc_compete", update.message.text)
-    await update.message.reply_text("*П21. Твій рівень на ПК?*", parse_mode="Markdown",
+    await update.message.reply_text("*П21. Як ти оцінюєш свій рівень користування ПК?*", parse_mode="Markdown",
         reply_markup=kb(["Початківець","Середній","Просунутий","Про / топ"]))
     return PC_LEVEL
 
@@ -525,7 +688,7 @@ async def console_play(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def console_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "console_model", update.message.text)
-    await update.message.reply_text("*П25. Скільки годин на консолі?*", parse_mode="Markdown",
+    await update.message.reply_text("*П25. Скільки годин на день граєш на консолі?*", parse_mode="Markdown",
         reply_markup=kb(["Менше 1 год","1–2 год","3–4 год","4+ год"]))
     return CONSOLE_HOURS
 
@@ -547,7 +710,7 @@ async def console_game(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def console_compete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "console_compete", update.message.text)
-    await update.message.reply_text("*П29. Хотів би консольну секцію у клубі?*", parse_mode="Markdown",
+    await update.message.reply_text("*П29. Хотів би Консольну секцію у шкільному клубі?*", parse_mode="Markdown",
         reply_markup=kb(["Так","Можливо","Ні"]))
     return CONSOLE_CLUB
 
@@ -618,7 +781,7 @@ async def _ask_mobile_other(update):
 
 async def mobile_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "mobile_other", update.message.text)
-    await update.message.reply_text("*П41. Жанр на мобільному?*", parse_mode="Markdown",
+    await update.message.reply_text("*П41. Твій улюблений жанр мобільних ігор?*", parse_mode="Markdown",
         reply_markup=kb(["Battle Royale","MOBA","Стратегія","Казуальна","Спортивна","Інший"]))
     return MOBILE_GENRE
 
@@ -636,7 +799,7 @@ async def mobile_compete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def mobile_level(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "mobile_level", update.message.text)
-    await update.message.reply_text("*П44. Хотів би мобільну секцію у клубі?*", parse_mode="Markdown",
+    await update.message.reply_text("*П44. Хотів би Мобільну секцію у шкільному клубі?*", parse_mode="Markdown",
         reply_markup=kb(["Так","Можливо","Ні"]))
     return MOBILE_CLUB
 
@@ -715,9 +878,9 @@ async def toxic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if val == "Так, часто":
         await update.message.reply_text(
             "Дякую, що довірився.\n\n"
-            "Якщо тобі зараз важко — не мовчи:\n"
+            "Якщо тобі зараз важко — можеш звернутись на Національну дитячу лінію психологічної підтримки:\n"
             "📞 *116 111* (безкоштовно з мобільного)\n"
-            "📞 *0 800 500 225*\n\n_Анонімно · психологи готові допомогти._",
+            "📞 *0 800 500 225*\n\n_Анонімно · конфіденційно · цілодобово._",
             parse_mode="Markdown")
     await update.message.reply_text("*П53. Наскільки важливо правило поваги у клубі?*", parse_mode="Markdown",
         reply_markup=kb(["Дуже важливо","Важливо","Байдуже"]))
@@ -756,7 +919,7 @@ async def club_important(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def parents_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "parents_support", update.message.text)
-    await update.message.reply_text("*П59. Батьки відпустять тебе на тренування після школи?*", parse_mode="Markdown",
+    await update.message.reply_text("*П59. Батьки відпустять тебе на тренування у клубі після уроків?*", parse_mode="Markdown",
         reply_markup=kb(["Так","Можливо","Ні"]))
     return PARENTS_ALLOW
 
@@ -785,12 +948,12 @@ async def future_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def ticket(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     val = update.message.text; save(ctx, "ticket", val)
     if val.startswith("Ні"): return await _finish(update, ctx)
-    await update.message.reply_text("*Як тебе звуть?* (для квитка)\n\nНапиши ім'я та прізвище:",
+    await update.message.reply_text("*Як звати одного з батьків?* (для зв'язку)\n\nНапиши ім'я та прізвище:",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-    return CONTACT_NAME
+    return PARENT_NAME
 
-async def contact_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    save(ctx, "contact_name", update.message.text)
+async def parent_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    save(ctx, "parent_name", update.message.text)
     await update.message.reply_text("*Телефон батьків для зв'язку:*\n\nНаприклад: +380991234567", parse_mode="Markdown")
     return CONTACT_PHONE
 
@@ -858,9 +1021,12 @@ def main():
         states={
             CONSENT:[MessageHandler(filters.TEXT&~filters.COMMAND,consent)],
             GENDER:[MessageHandler(filters.TEXT&~filters.COMMAND,gender)],
-            GRADE:[MessageHandler(filters.TEXT&~filters.COMMAND,grade)],
             REGION:[MessageHandler(filters.TEXT&~filters.COMMAND,region)],
+            FULL_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,full_name)],
+            GRADE:[MessageHandler(filters.TEXT&~filters.COMMAND,grade)],
+            GRADE_LETTER:[MessageHandler(filters.TEXT&~filters.COMMAND,grade_letter)],
             CITY_TYPE:[MessageHandler(filters.TEXT&~filters.COMMAND,city_type)],
+            CITY_SELECT:[MessageHandler(filters.TEXT&~filters.COMMAND,city_select)],
             CITY_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,city_name)],
             DISTRICT:[MessageHandler(filters.TEXT&~filters.COMMAND,district)],
             SCHOOL_TYPE:[MessageHandler(filters.TEXT&~filters.COMMAND,school_type)],
@@ -923,7 +1089,7 @@ def main():
             FUTURE:[MessageHandler(filters.TEXT&~filters.COMMAND,future)],
             FUTURE_ROLE:[MessageHandler(filters.TEXT&~filters.COMMAND,future_role)],
             TICKET:[MessageHandler(filters.TEXT&~filters.COMMAND,ticket)],
-            CONTACT_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,contact_name)],
+            PARENT_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,parent_name)],
             CONTACT_PHONE:[MessageHandler(filters.TEXT&~filters.COMMAND,contact_phone)],
             CONTACT_TIME:[MessageHandler(filters.TEXT&~filters.COMMAND,contact_time)],
         },

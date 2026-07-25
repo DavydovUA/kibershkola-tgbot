@@ -385,7 +385,10 @@ def kb(options, cols=2):
                                resize_keyboard=True, one_time_keyboard=True)
 
 def save(ctx, key, val): ctx.user_data[key] = val
-def grade_int(ctx): return int(ctx.user_data.get("grade", 0))
+def grade_int(ctx):
+    raw = str(ctx.user_data.get("grade", 0))
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    return int(digits) if digits else 0
 
 # ── СТАРТ ──────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -419,7 +422,15 @@ async def consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def gender(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "gender", update.message.text)
     await update.message.reply_text(
-        "*П2. Яка твоя область?*",
+        "*П2. Напиши своє Ім'я та Прізвище повністю українською мовою.*",
+        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
+    )
+    return FULL_NAME
+
+async def full_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    save(ctx, "contact_name", update.message.text)
+    await update.message.reply_text(
+        "*П3. Яка твоя область?*",
         parse_mode="Markdown",
         reply_markup=kb([
             "Вінницька","Волинська","Дніпропетровська","Донецька",
@@ -435,14 +446,6 @@ async def gender(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def region(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "region", update.message.text)
-    await update.message.reply_text(
-        "*П3. Напиши своє Ім'я та Прізвище повністю українською мовою.*",
-        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
-    )
-    return FULL_NAME
-
-async def full_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    save(ctx, "contact_name", update.message.text)
     await update.message.reply_text(
         "*П4. В якому ти класі?*",
         parse_mode="Markdown",
@@ -467,7 +470,10 @@ async def grade_letter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         save(ctx, "grade", num)
     await update.message.reply_text(
-        "*П5. Напиши перші літери назви твого міста, селища або села:*",
+        "*П5. Де ти живеш?*\n\n"
+        "Напиши перші 3-4 літери назви свого міста, селища або села — "
+        "бот покаже список схожих варіантів, і ти обереш потрібний.\n\n"
+        "_Наприклад: «Бров» → покаже Бровари_",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove()
     )
@@ -482,14 +488,17 @@ async def city_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if matches:
         options = matches + ["Не знайшов — напишу сам"]
         await update.message.reply_text(
-            "*Обери зі списку або натисни «Не знайшов»:*",
+            "*Ось що знайшлось. Обери свій населений пункт зі списку,*\n"
+            "*або натисни «Не знайшов — напишу сам», якщо його немає в переліку:*",
             parse_mode="Markdown",
             reply_markup=kb(options, cols=2)
         )
         return CITY_SELECT
     else:
         await update.message.reply_text(
-            "Нічого не знайшли автоматично. Напиши повну назву населеного пункту сам:",
+            "Нічого не знайшли за цим запитом у твоїй області.\n\n"
+            "Спробуй ввести назву інакше, або просто напиши повну назву "
+            "свого населеного пункту — і ми запишемо її як є:",
             reply_markup=ReplyKeyboardRemove()
         )
         return CITY_NAME

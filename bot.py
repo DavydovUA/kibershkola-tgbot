@@ -75,11 +75,9 @@ from PIL import Image, ImageDraw, ImageFont
 import qrcode
 
 FONT_DIR = "fonts"
+TEMPLATE_PATH = "templates/passport_template.png"
 
 NAVY = (16, 34, 74)
-BLUE_ACCENT = (30, 80, 200)
-GOLD = (240, 180, 60)
-LIGHT_BG = (238, 241, 245)
 GRAY_TEXT = (110, 120, 140)
 
 def font(size, bold=False):
@@ -92,173 +90,70 @@ def get_initials(name):
         return (parts[0][0] + parts[1][0]).upper()
     return (name[:2] if name else "??").upper()
 
-def make_qr(data, size=170):
+def make_qr(data, size=130):
     qr = qrcode.QRCode(border=1, box_size=6)
     qr.add_data(data)
     qr.make(fit=True)
     img = qr.make_image(fill_color=NAVY, back_color="white").convert("RGB")
     return img.resize((size, size))
 
-def draw_ukraine_flag(draw, x, y, w, h):
-    draw.rectangle([x, y, x+w, y+h//2], fill=(0, 87, 183))
-    draw.rectangle([x, y+h//2, x+w, y+h], fill=(255, 215, 0))
-
 def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
-    W, H = 1011, 638
-    img = Image.new("RGB", (W, H), "#ffffff")
+    """
+    Бере ЗАТВЕРДЖЕНИЙ шаблон паспорта (templates/passport_template.png) як фон
+    і накладає ТІЛЬКИ змінні дані. Дизайн шаблону (прапор, заголовок, бейдж
+    «ГРАВЕЦЬ», логотип ліги, голограма, підпис, футер) НЕ перемальовується —
+    він завжди береться з оригінального файлу як є.
+    """
+    img = Image.open(TEMPLATE_PATH).convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # Фон з легким відтінком
-    draw.rounded_rectangle([0, 0, W, H], radius=28, fill=LIGHT_BG)
-    draw.rounded_rectangle([6, 6, W-6, H-6], radius=24, outline=BLUE_ACCENT, width=5)
-
-    pad = 46
-
-    # Прапор України
-    draw_ukraine_flag(draw, pad, 40, 76, 50)
-
-    # Заголовок
-    title_font = font(40, bold=True)
-    draw.text((pad+96, 30), "ПАСПОРТ СПОРТСМЕНА", font=title_font, fill=NAVY)
-    sub_font = font(17, bold=True)
-    draw.text((pad+98, 78), "ШКІЛЬНА СПОРТИВНА ЛІГА", font=sub_font, fill=BLUE_ACCENT)
-
-    # ── Фото (ліворуч) — ініціали замість реального фото ──
-    photo_x, photo_y = pad, 140
-    photo_w, photo_h = 210, 260
-    role = answers.get("club_role") or "Гравець"
-    draw.rounded_rectangle([photo_x, photo_y, photo_x+photo_w, photo_y+photo_h],
-                            radius=10, fill=(220, 226, 235), outline=BLUE_ACCENT, width=2)
+    # ── Фото: ініціали замість реального фото (приватність дітей) ──
+    photo_box = [88, 135, 290, 388]
     initials = get_initials(answers.get("contact_name", ""))
-    init_font = font(64, bold=True)
-    ib = draw.textbbox((0,0), initials, font=init_font)
+    init_font = font(62, bold=True)
+    ib = draw.textbbox((0, 0), initials, font=init_font)
     iw, ih = ib[2]-ib[0], ib[3]-ib[1]
-    draw.text((photo_x+photo_w/2-iw/2, photo_y+photo_h/2-ih/2-30), initials,
-               font=init_font, fill=BLUE_ACCENT)
-    cap_font = font(13)
-    cap_text = "ФОТО"
-    cb = draw.textbbox((0,0), cap_text, font=cap_font)
-    draw.text((photo_x+photo_w/2-(cb[2]-cb[0])/2, photo_y+photo_h-28),
-               cap_text, font=cap_font, fill=GRAY_TEXT)
+    cx = (photo_box[0]+photo_box[2])//2
+    cy = (photo_box[1]+photo_box[3])//2 - 15
+    draw.text((cx-iw/2, cy-ih/2), initials, font=init_font, fill=(90, 130, 210))
 
-    # ── Бейдж типу ліцензії (під фото) ──
-    badge_y = photo_y + photo_h + 16
-    badge_h = 78
-    draw.rounded_rectangle([photo_x, badge_y, photo_x+photo_w, badge_y+badge_h],
-                            radius=10, fill=(225, 232, 250), outline=GOLD, width=2)
-    lic_label_font = font(12, bold=True)
-    draw.text((photo_x+14, badge_y+10), "ТИП ЛІЦЕНЗІЇ", font=lic_label_font, fill=BLUE_ACCENT)
-    role_font = font(24, bold=True)
-    draw.text((photo_x+14, badge_y+30), role.upper(), font=role_font, fill=NAVY)
-
-    # ── Видано / Дійсна до ──
-    dates_y = badge_y + badge_h + 12
-    dates_h = 62
-    draw.rounded_rectangle([photo_x, dates_y, photo_x+photo_w, dates_y+dates_h],
-                            radius=10, outline=(180, 190, 205), width=1)
-    small_font = font(11, bold=True)
-    val_font = font(13)
-    today = datetime.date.today()
-    valid_until = today.replace(year=today.year + 1)
-    draw.text((photo_x+12, dates_y+8), "ВИДАНО", font=small_font, fill=GRAY_TEXT)
-    draw.text((photo_x+12, dates_y+24), today.strftime("%d.%m.%Y"), font=val_font, fill=NAVY)
-    draw.line([photo_x+photo_w/2, dates_y+6, photo_x+photo_w/2, dates_y+dates_h-6],
-               fill=(200,200,200), width=1)
-    draw.text((photo_x+photo_w/2+12, dates_y+8), "ДІЙСНА ДО", font=small_font, fill=GRAY_TEXT)
-    draw.text((photo_x+photo_w/2+12, dates_y+24), valid_until.strftime("%d.%m.%Y"), font=val_font, fill=NAVY)
-    lic_foot_font = font(10)
-    foot_text = "СПОРТИВНА ІГРОВА ЛІЦЕНЗІЯ"
-    fb = draw.textbbox((0,0), foot_text, font=lic_foot_font)
-    draw.text((photo_x+photo_w/2-(fb[2]-fb[0])/2, dates_y+dates_h+6), foot_text,
-               font=lic_foot_font, fill=GRAY_TEXT)
-
-    # ── Права колонка: дані ──
-    info_x = photo_x + photo_w + 44
-    info_y = 150
-    label_font = font(13, bold=True)
+    # ── Дані у правому інфо-стовпчику (координати виміряні по шаблону) ──
     value_font = font(24, bold=True)
+    col_x = 352
 
-    def info_row(y, label_ua, label_en, value):
-        label_text = f"{label_ua} / {label_en}" if label_en else label_ua
-        draw.text((info_x, y), label_text, font=label_font, fill=BLUE_ACCENT)
-        draw.text((info_x, y+22), str(value) if value else "—", font=value_font, fill=NAVY)
-        line_y = y + 58
-        draw.line([info_x, line_y, info_x + 380, line_y], fill=(170,180,200), width=1)
-        return line_y + 22
+    name = answers.get("contact_name", "—")
+    draw.text((col_x, 224), name, font=value_font, fill=NAVY)
 
-    y = info_row(info_y, "ІМ'Я ТА ПРІЗВИЩЕ", "NAME AND SURNAME", answers.get("contact_name", ""))
-    nickname = answers.get("nickname") or "—"
-    y = info_row(y, "НІК", None, nickname)
-    y = info_row(y, "ШКОЛА", None, answers.get("school_name", ""))
-    y = info_row(y, "КЛАС", None, answers.get("grade", ""))
+    nick = answers.get("nickname") or "—"
+    draw.text((col_x, 310), nick, font=font(19), fill=NAVY)
 
-    # ── Логотип школи (заглушка) — праворуч вгорі ──
-    logo_x, logo_y = W - pad - 150, 60
-    logo_size = 150
-    draw.rounded_rectangle([logo_x, logo_y, logo_x+logo_size, logo_y+logo_size],
-                            radius=10, outline=BLUE_ACCENT, width=2, fill=(230,235,245))
-    logo_font = font(11)
-    logo_text = "ЛОГОТИП ШКОЛИ"
-    lb = draw.textbbox((0,0), logo_text, font=logo_font)
-    draw.text((logo_x+logo_size/2-(lb[2]-lb[0])/2, logo_y+logo_size/2-8),
-               logo_text, font=logo_font, fill=GRAY_TEXT)
+    school = answers.get("school_name", "—")
+    draw.text((col_x, 396), school, font=font(19), fill=NAVY)
 
-    # № документа
-    docnum_font = font(14, bold=True)
-    docnum_text = f"№ ДОКУМЕНТА"
-    dn = draw.textbbox((0,0), docnum_text, font=docnum_font)
-    draw.text((logo_x+logo_size/2-(dn[2]-dn[0])/2, logo_y+logo_size+14),
-               docnum_text, font=docnum_font, fill=BLUE_ACCENT)
-    num_val_font = font(16, bold=True)
-    nv = draw.textbbox((0,0), passport_number, font=num_val_font)
-    draw.text((logo_x+logo_size/2-(nv[2]-nv[0])/2, logo_y+logo_size+34),
-               passport_number, font=num_val_font, fill=NAVY)
+    grade = answers.get("grade", "—")
+    draw.text((col_x, 483), str(grade), font=font(19), fill=NAVY)
 
-    # ── QR-код — праворуч знизу ──
-    qr_size = 170
-    qr_x = W - pad - qr_size
-    qr_y = logo_y + logo_size + 70
+    # ── Дати: Видано / Дійсна до ──
+    issued = datetime.date.today()
+    valid_until = issued.replace(year=issued.year + 1)
+    date_font = font(15)
+    draw.text((65, 542), issued.strftime("%d.%m.%Y"), font=date_font, fill=NAVY)
+    draw.text((208, 542), valid_until.strftime("%d.%m.%Y"), font=date_font, fill=NAVY)
+
+    # ── № документа ──
+    docnum_font = font(16, bold=True)
+    dn = draw.textbbox((0, 0), passport_number, font=docnum_font)
+    draw.text((852 - (dn[2]-dn[0])/2, 282), passport_number, font=docnum_font, fill=NAVY)
+
+    # ── QR-код — справжній, скановуваний, вставлений у фіксовану рамку шаблону ──
     qr_data = f"KIBERSHKOLA-{passport_number}"
-    qr_img = make_qr(qr_data, size=qr_size-14)
-    draw.rounded_rectangle([qr_x, qr_y, qr_x+qr_size, qr_y+qr_size],
-                            radius=10, outline=NAVY, width=3)
-    img.paste(qr_img, (qr_x+7, qr_y+7))
-
-    # ── Голографічний декоративний круг (спрощено) ──
-    circle_cx = info_x + 200
-    circle_cy = qr_y + qr_size//2
-    for i, r in enumerate(range(70, 40, -6)):
-        shade = GOLD if i % 2 == 0 else BLUE_ACCENT
-        draw.ellipse([circle_cx-r, circle_cy-r, circle_cx+r, circle_cy+r],
-                      outline=shade, width=2)
-
-    # ── Підпис (стилізований) ──
-    sig_font = font(13)
-    draw.line([info_x, H-70, info_x+250, H-70], fill=(120,120,120), width=1)
-    # проста стилізована лінія підпису
-    import math
-    sig_points = []
-    sx, sy = info_x+20, H-95
-    for i in range(40):
-        t = i / 40
-        sig_points.append((sx + t*200, sy + 18*math.sin(t*10) - t*8))
-    draw.line(sig_points, fill=NAVY, width=2, joint="curve")
-
-    # ── Підвал ──
-    footer_font = font(13, bold=True)
-    footer_text = "СТРОК ДІЇ — ОДИН РІК"
-    fo = draw.textbbox((0,0), footer_text, font=footer_font)
-    draw.line([pad, H-36, W/2-(fo[2]-fo[0])/2-20, H-36], fill=GOLD, width=2)
-    draw.line([W/2+(fo[2]-fo[0])/2+20, H-36, W-pad, H-36], fill=GOLD, width=2)
-    draw.text((W/2-(fo[2]-fo[0])/2, H-44), footer_text, font=footer_font, fill=NAVY)
-    draw.ellipse([pad-4, H-40, pad+4, H-32], fill=BLUE_ACCENT)
-    draw.ellipse([W-pad-4, H-40, W-pad+4, H-32], fill=BLUE_ACCENT)
+    qr_img = make_qr(qr_data, size=130)
+    img.paste(qr_img, (786, 330))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
     return buf
-
 SHEET_ID = "1f61HYd4MQQnBj6z-mWrZ-2arn0r6r9WWbYJ4vphPY1s"
 
 _gsheet = None

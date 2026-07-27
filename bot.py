@@ -68,176 +68,191 @@ MAJOR_CITY_DISTRICTS = {
 # ── GOOGLE SHEETS ────────────────────────────────────────────────
 import gspread
 from google.oauth2.service_account import Credentials
+
+# ── ГЕНЕРАЦІЯ ПАСПОРТА ГРАВЦЯ (за затвердженим макетом) ──────────
 import io
 from PIL import Image, ImageDraw, ImageFont
-import barcode
-from barcode.writer import ImageWriter
+import qrcode
 
-# ── ГЕНЕРАЦІЯ ПАСПОРТА ГРАВЦЯ ────────────────────────────────────
 FONT_DIR = "fonts"
 
-ROLE_COLORS = {
-    "Гравець": ("#E1F5EE", "#0F6E56", "#085041"),
-    "Стример / коментатор": ("#EEEDFE", "#534AB7", "#3C3489"),
-    "Організатор турнірів": ("#FAEEDA", "#854F0B", "#633806"),
-    "Контент-мейкер": ("#FBEAF0", "#993556", "#72243E"),
-    "Суддя / рефері": ("#FAECE7", "#993C1D", "#712B13"),
-    "Спостерігач": ("#F1EFE8", "#5F5E5A", "#444441"),
-}
-DEFAULT_PASSPORT_COLOR = ("#E6F1FB", "#185FA5", "#0C447C")
+NAVY = (16, 34, 74)
+BLUE_ACCENT = (30, 80, 200)
+GOLD = (240, 180, 60)
+LIGHT_BG = (238, 241, 245)
+GRAY_TEXT = (110, 120, 140)
 
-def _hex_to_rgb(h):
-    h = h.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-
-def _get_initials(first, last):
-    a = first[0].upper() if first else ""
-    b = last[0].upper() if last else ""
-    return (a + b) or "??"
-
-def _split_name(full_name):
-    parts = (full_name or "").strip().split()
-    if len(parts) >= 2:
-        return parts[0], " ".join(parts[1:])
-    elif len(parts) == 1:
-        return parts[0], ""
-    return "Гравець", ""
-
-def _passport_font(size, bold=False):
+def font(size, bold=False):
     path = f"{FONT_DIR}/DejaVuSans-Bold.ttf" if bold else f"{FONT_DIR}/DejaVuSans.ttf"
     return ImageFont.truetype(path, size)
 
-def _make_barcode(code_text):
-    writer = ImageWriter()
-    writer.set_options({
-        "module_height": 12.0,
-        "module_width": 0.35,
-        "quiet_zone": 2.0,
-        "font_size": 0,
-        "text_distance": 0,
-        "write_text": False,
-        "background": "white",
-        "foreground": "black",
-    })
-    code = barcode.get("code128", code_text, writer=writer)
-    buf = io.BytesIO()
-    code.write(buf)
-    buf.seek(0)
-    return Image.open(buf).convert("RGB")
+def get_initials(name):
+    parts = (name or "").strip().split()
+    if len(parts) >= 2:
+        return (parts[0][0] + parts[1][0]).upper()
+    return (name[:2] if name else "??").upper()
+
+def make_qr(data, size=170):
+    qr = qrcode.QRCode(border=1, box_size=6)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color=NAVY, back_color="white").convert("RGB")
+    return img.resize((size, size))
+
+def draw_ukraine_flag(draw, x, y, w, h):
+    draw.rectangle([x, y, x+w, y+h//2], fill=(0, 87, 183))
+    draw.rectangle([x, y+h//2, x+w, y+h], fill=(255, 215, 0))
 
 def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
-    W, H = 900, 620
+    W, H = 1011, 638
     img = Image.new("RGB", (W, H), "#ffffff")
     draw = ImageDraw.Draw(img)
 
+    # Фон з легким відтінком
+    draw.rounded_rectangle([0, 0, W, H], radius=28, fill=LIGHT_BG)
+    draw.rounded_rectangle([6, 6, W-6, H-6], radius=24, outline=BLUE_ACCENT, width=5)
+
+    pad = 46
+
+    # Прапор України
+    draw_ukraine_flag(draw, pad, 40, 76, 50)
+
+    # Заголовок
+    title_font = font(40, bold=True)
+    draw.text((pad+96, 30), "ПАСПОРТ СПОРТСМЕНА", font=title_font, fill=NAVY)
+    sub_font = font(17, bold=True)
+    draw.text((pad+98, 78), "ШКІЛЬНА СПОРТИВНА ЛІГА", font=sub_font, fill=BLUE_ACCENT)
+
+    # ── Фото (ліворуч) — ініціали замість реального фото ──
+    photo_x, photo_y = pad, 140
+    photo_w, photo_h = 210, 260
     role = answers.get("club_role") or "Гравець"
-    bg_hex, border_hex, text_hex = ROLE_COLORS.get(role, DEFAULT_PASSPORT_COLOR)
-    border_rgb = _hex_to_rgb(border_hex)
-    bg_rgb = _hex_to_rgb(bg_hex)
-    text_rgb = _hex_to_rgb(text_hex)
-
-    draw.rounded_rectangle([8, 8, W-8, H-8], radius=24, fill="#ffffff", outline=border_rgb, width=4)
-    draw.rounded_rectangle([8, 8, W-8, 64], radius=24, fill=border_rgb)
-    draw.rectangle([8, 44, W-8, 64], fill=border_rgb)
-
-    club_font = _passport_font(22, bold=True)
-    draw.text((40, 16), "КІБЕРСПОРТИВНИЙ КЛУБ ШКОЛИ", font=club_font, fill="#ffffff")
-    num_font = _passport_font(18)
-    nb = draw.textbbox((0,0), passport_number, font=num_font)
-    draw.text((W-40-(nb[2]-nb[0]), 18), passport_number, font=num_font, fill="#ffffff")
-
-    pad = 40
-    top = 90
-
-    role_upper = role.upper()
-    badge_font = _passport_font(18, bold=True)
-    bbox = draw.textbbox((0,0), role_upper, font=badge_font)
-    badge_w = (bbox[2]-bbox[0]) + 36
-    draw.rounded_rectangle([pad, top, pad+badge_w, top+36], radius=18, fill=bg_rgb)
-    draw.text((pad+18, top+7), role_upper, font=badge_font, fill=text_rgb)
-
-    level = answers.get("player_level", "Новачок")
-    level_font = _passport_font(16, bold=True)
-    level_text = f"РІВЕНЬ: {level.upper()}"
-    lb = draw.textbbox((0,0), level_text, font=level_font)
-    draw.rounded_rectangle([W-pad-(lb[2]-lb[0])-36, top, W-pad, top+36], radius=18,
-                            outline=border_rgb, width=2)
-    draw.text((W-pad-(lb[2]-lb[0])-18, top+7), level_text, font=level_font, fill=border_rgb)
-
-    avatar_y = top + 56
-    avatar_size = 116
-    first_name, last_name = _split_name(answers.get("contact_name", ""))
-    draw.ellipse([pad, avatar_y, pad+avatar_size, avatar_y+avatar_size], fill=border_rgb)
-    initials = _get_initials(first_name, last_name)
-    init_font = _passport_font(44, bold=True)
+    draw.rounded_rectangle([photo_x, photo_y, photo_x+photo_w, photo_y+photo_h],
+                            radius=10, fill=(220, 226, 235), outline=BLUE_ACCENT, width=2)
+    initials = get_initials(answers.get("contact_name", ""))
+    init_font = font(64, bold=True)
     ib = draw.textbbox((0,0), initials, font=init_font)
     iw, ih = ib[2]-ib[0], ib[3]-ib[1]
-    draw.text((pad+avatar_size/2-iw/2, avatar_y+avatar_size/2-ih/2-10), initials, font=init_font, fill="#ffffff")
+    draw.text((photo_x+photo_w/2-iw/2, photo_y+photo_h/2-ih/2-30), initials,
+               font=init_font, fill=BLUE_ACCENT)
+    cap_font = font(13)
+    cap_text = "ФОТО"
+    cb = draw.textbbox((0,0), cap_text, font=cap_font)
+    draw.text((photo_x+photo_w/2-(cb[2]-cb[0])/2, photo_y+photo_h-28),
+               cap_text, font=cap_font, fill=GRAY_TEXT)
 
-    info_x = pad + avatar_size + 28
-    info_w = W - pad - info_x
+    # ── Бейдж типу ліцензії (під фото) ──
+    badge_y = photo_y + photo_h + 16
+    badge_h = 78
+    draw.rounded_rectangle([photo_x, badge_y, photo_x+photo_w, badge_y+badge_h],
+                            radius=10, fill=(225, 232, 250), outline=GOLD, width=2)
+    lic_label_font = font(12, bold=True)
+    draw.text((photo_x+14, badge_y+10), "ТИП ЛІЦЕНЗІЇ", font=lic_label_font, fill=BLUE_ACCENT)
+    role_font = font(24, bold=True)
+    draw.text((photo_x+14, badge_y+30), role.upper(), font=role_font, fill=NAVY)
 
-    name_font = _passport_font(30, bold=True)
-    draw.text((info_x, avatar_y - 4), f"{last_name} {first_name}".strip(), font=name_font, fill=(30,30,30))
+    # ── Видано / Дійсна до ──
+    dates_y = badge_y + badge_h + 12
+    dates_h = 62
+    draw.rounded_rectangle([photo_x, dates_y, photo_x+photo_w, dates_y+dates_h],
+                            radius=10, outline=(180, 190, 205), width=1)
+    small_font = font(11, bold=True)
+    val_font = font(13)
+    today = datetime.date.today()
+    valid_until = today.replace(year=today.year + 1)
+    draw.text((photo_x+12, dates_y+8), "ВИДАНО", font=small_font, fill=GRAY_TEXT)
+    draw.text((photo_x+12, dates_y+24), today.strftime("%d.%m.%Y"), font=val_font, fill=NAVY)
+    draw.line([photo_x+photo_w/2, dates_y+6, photo_x+photo_w/2, dates_y+dates_h-6],
+               fill=(200,200,200), width=1)
+    draw.text((photo_x+photo_w/2+12, dates_y+8), "ДІЙСНА ДО", font=small_font, fill=GRAY_TEXT)
+    draw.text((photo_x+photo_w/2+12, dates_y+24), valid_until.strftime("%d.%m.%Y"), font=val_font, fill=NAVY)
+    lic_foot_font = font(10)
+    foot_text = "СПОРТИВНА ІГРОВА ЛІЦЕНЗІЯ"
+    fb = draw.textbbox((0,0), foot_text, font=lic_foot_font)
+    draw.text((photo_x+photo_w/2-(fb[2]-fb[0])/2, dates_y+dates_h+6), foot_text,
+               font=lic_foot_font, fill=GRAY_TEXT)
 
-    row_font = _passport_font(18)
-    label_font = _passport_font(14)
-    row_y = avatar_y + 44
+    # ── Права колонка: дані ──
+    info_x = photo_x + photo_w + 44
+    info_y = 150
+    label_font = font(13, bold=True)
+    value_font = font(24, bold=True)
 
-    school = answers.get("school_name", "—")
-    grade = answers.get("grade", "—")
+    def info_row(y, label_ua, label_en, value):
+        label_text = f"{label_ua} / {label_en}" if label_en else label_ua
+        draw.text((info_x, y), label_text, font=label_font, fill=BLUE_ACCENT)
+        draw.text((info_x, y+22), str(value) if value else "—", font=value_font, fill=NAVY)
+        line_y = y + 58
+        draw.line([info_x, line_y, info_x + 380, line_y], fill=(170,180,200), width=1)
+        return line_y + 22
 
-    draw.text((info_x, row_y), "ШКОЛА", font=label_font, fill=(153,153,153))
-    draw.text((info_x, row_y+18), school, font=row_font, fill=(51,51,51))
+    y = info_row(info_y, "ІМ'Я ТА ПРІЗВИЩЕ", "NAME AND SURNAME", answers.get("contact_name", ""))
+    nickname = answers.get("nickname") or "—"
+    y = info_row(y, "НІК", None, nickname)
+    y = info_row(y, "ШКОЛА", None, answers.get("school_name", ""))
+    y = info_row(y, "КЛАС", None, answers.get("grade", ""))
 
-    col2_x = info_x + info_w * 0.62
-    draw.text((col2_x, row_y), "КЛАС", font=label_font, fill=(153,153,153))
-    draw.text((col2_x, row_y+18), f"{grade}" if grade else "—", font=row_font, fill=(51,51,51))
+    # ── Логотип школи (заглушка) — праворуч вгорі ──
+    logo_x, logo_y = W - pad - 150, 60
+    logo_size = 150
+    draw.rounded_rectangle([logo_x, logo_y, logo_x+logo_size, logo_y+logo_size],
+                            radius=10, outline=BLUE_ACCENT, width=2, fill=(230,235,245))
+    logo_font = font(11)
+    logo_text = "ЛОГОТИП ШКОЛИ"
+    lb = draw.textbbox((0,0), logo_text, font=logo_font)
+    draw.text((logo_x+logo_size/2-(lb[2]-lb[0])/2, logo_y+logo_size/2-8),
+               logo_text, font=logo_font, fill=GRAY_TEXT)
 
-    line_y = avatar_y + avatar_size + 26
-    draw.line([pad, line_y, W-pad, line_y], fill=(230,230,225), width=2)
+    # № документа
+    docnum_font = font(14, bold=True)
+    docnum_text = f"№ ДОКУМЕНТА"
+    dn = draw.textbbox((0,0), docnum_text, font=docnum_font)
+    draw.text((logo_x+logo_size/2-(dn[2]-dn[0])/2, logo_y+logo_size+14),
+               docnum_text, font=docnum_font, fill=BLUE_ACCENT)
+    num_val_font = font(16, bold=True)
+    nv = draw.textbbox((0,0), passport_number, font=num_val_font)
+    draw.text((logo_x+logo_size/2-(nv[2]-nv[0])/2, logo_y+logo_size+34),
+               passport_number, font=num_val_font, fill=NAVY)
 
-    stat_font = _passport_font(19)
-    stat_label_font = _passport_font(15)
-    stats = []
+    # ── QR-код — праворуч знизу ──
+    qr_size = 170
+    qr_x = W - pad - qr_size
+    qr_y = logo_y + logo_size + 70
+    qr_data = f"KIBERSHKOLA-{passport_number}"
+    qr_img = make_qr(qr_data, size=qr_size-14)
+    draw.rounded_rectangle([qr_x, qr_y, qr_x+qr_size, qr_y+qr_size],
+                            radius=10, outline=NAVY, width=3)
+    img.paste(qr_img, (qr_x+7, qr_y+7))
 
-    esports = answers.get("esports_know", "")
-    if esports:
-        stats.append(("Кіберспорт", esports))
-    club_join = answers.get("club_join", "")
-    if club_join:
-        stats.append(("Хоче до клубу", club_join))
-    sport_active = answers.get("sport_active", "")
-    if sport_active and sport_active != "Ні":
-        stats.append(("Спорт", answers.get("sport_type", sport_active)))
-    if answers.get("mobile_play") == "Так":
-        games = []
-        for g, label in [("game_brawl","Brawl Stars"),("game_roblox","Roblox"),
-                          ("game_minecraft","Minecraft"),("game_clash","Clash Royale"),
-                          ("game_hok","Honor of Kings"),("game_mlbb","MLBB"),
-                          ("game_pubg","PUBG Mobile")]:
-            if answers.get(g) == "Так":
-                games.append(label)
-        if games:
-            stats.append(("Ігри", ", ".join(games[:3])))
+    # ── Голографічний декоративний круг (спрощено) ──
+    circle_cx = info_x + 200
+    circle_cy = qr_y + qr_size//2
+    for i, r in enumerate(range(70, 40, -6)):
+        shade = GOLD if i % 2 == 0 else BLUE_ACCENT
+        draw.ellipse([circle_cx-r, circle_cy-r, circle_cx+r, circle_cy+r],
+                      outline=shade, width=2)
 
-    y = line_y + 20
-    for label, value in stats[:3]:
-        draw.text((pad, y), label, font=stat_label_font, fill=(153,153,153))
-        vb = draw.textbbox((0,0), str(value), font=stat_font)
-        draw.text((W-pad-(vb[2]-vb[0]), y-3), str(value), font=stat_font, fill=(51,51,51))
-        y += 32
+    # ── Підпис (стилізований) ──
+    sig_font = font(13)
+    draw.line([info_x, H-70, info_x+250, H-70], fill=(120,120,120), width=1)
+    # проста стилізована лінія підпису
+    import math
+    sig_points = []
+    sx, sy = info_x+20, H-95
+    for i in range(40):
+        t = i / 40
+        sig_points.append((sx + t*200, sy + 18*math.sin(t*10) - t*8))
+    draw.line(sig_points, fill=NAVY, width=2, joint="curve")
 
-    barcode_img = _make_barcode(passport_number.replace(" ", ""))
-    bc_target_w = W - 2*pad
-    bc_ratio = barcode_img.height / barcode_img.width
-    bc_h = int(bc_target_w * bc_ratio)
-    bc_h = min(bc_h, 90)
-    bc_w = int(bc_h / bc_ratio)
-    barcode_img = barcode_img.resize((bc_w, bc_h))
-    bc_x = (W - bc_w) // 2
-    bc_y = H - bc_h - 30
-    img.paste(barcode_img, (bc_x, bc_y))
+    # ── Підвал ──
+    footer_font = font(13, bold=True)
+    footer_text = "СТРОК ДІЇ — ОДИН РІК"
+    fo = draw.textbbox((0,0), footer_text, font=footer_font)
+    draw.line([pad, H-36, W/2-(fo[2]-fo[0])/2-20, H-36], fill=GOLD, width=2)
+    draw.line([W/2+(fo[2]-fo[0])/2+20, H-36, W-pad, H-36], fill=GOLD, width=2)
+    draw.text((W/2-(fo[2]-fo[0])/2, H-44), footer_text, font=footer_font, fill=NAVY)
+    draw.ellipse([pad-4, H-40, pad+4, H-32], fill=BLUE_ACCENT)
+    draw.ellipse([W-pad-4, H-40, W-pad+4, H-32], fill=BLUE_ACCENT)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -999,10 +1014,10 @@ async def _finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Генеруємо і надсилаємо паспорт гравця
     try:
         passport_data = dict(d)
+        tg_user = update.effective_user
         if not passport_data.get("contact_name"):
-            tg_user = update.effective_user
             passport_data["contact_name"] = f"{tg_user.first_name or ''} {tg_user.last_name or ''}".strip() or "Гравець"
-        passport_data["player_level"] = "Новачок"
+        passport_data["nickname"] = f"@{tg_user.username}" if tg_user.username else "—"
         passport_number = f"KS-2026-{update.effective_user.id % 10000:04d}"
         photo_buf = generate_passport(passport_data, passport_number)
         await update.message.reply_photo(

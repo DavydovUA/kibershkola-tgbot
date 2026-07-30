@@ -1,6 +1,8 @@
 import logging
 import os
 import datetime
+import asyncio
+import re
 import httpx
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
@@ -80,6 +82,7 @@ TEMPLATE_PATH = "templates/passport_template.png"
 NAVY = (16, 34, 74)
 GRAY_TEXT = (110, 120, 140)
 SILHOUETTE_BLUE = (150, 175, 215)
+RIGHT_COLUMN_CENTER_X = 851
 
 def font(size, bold=False):
     path = f"{FONT_DIR}/DejaVuSans-Bold.ttf" if bold else f"{FONT_DIR}/DejaVuSans.ttf"
@@ -152,7 +155,7 @@ def draw_silhouette(draw, box):
     # Прямокутник щоб «дообрізати» низ силуету по межі фото-блоку
     draw.rectangle([x0, min(y1-2, shoulder_top+shoulder_w*0.55), x1, y1], fill=None)
 
-def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
+def generate_passport(answers: dict, passport_number: str, verification_url: str = "") -> io.BytesIO:
     """
     Бере ЗАТВЕРДЖЕНИЙ шаблон паспорта (templates/passport_template.png) як фон
     і накладає ТІЛЬКИ змінні дані. Дизайн шаблону (прапор, заголовок, бейдж
@@ -193,19 +196,21 @@ def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
 
     # ── Дати: Видано / Дійсна до ──
     issued = datetime.date.today()
-    valid_until = issued.replace(year=issued.year + 1)
+    valid_until = add_one_year(issued)
     date_font = font(15)
     draw.text((65, 542), issued.strftime("%d.%m.%Y"), font=date_font, fill=NAVY)
     draw.text((208, 542), valid_until.strftime("%d.%m.%Y"), font=date_font, fill=NAVY)
 
-    # ── № документа — через крапки, наприклад 26 • 00 • 0001 (або A • 26 • 00 • 0001) ──
+    # ── № документа та QR містять один і той самий ідентифікатор ──
+    # Канонічний формат: AA-26-00-0001. На картці дефіси лише візуально
+    # замінюються крапками: AA • 26 • 00 • 0001.
     doc_pretty = passport_number.replace("-", " • ")
     docnum_font = font(16, bold=True)
     dn = draw.textbbox((0, 0), doc_pretty, font=docnum_font)
     if dn[2]-dn[0] > 150:
         docnum_font = font(13, bold=True)
         dn = draw.textbbox((0, 0), doc_pretty, font=docnum_font)
-    draw.text((852 - (dn[2]-dn[0])/2, 284), doc_pretty, font=docnum_font, fill=NAVY)
+    draw.text((RIGHT_COLUMN_CENTER_X - (dn[2]-dn[0])/2, 284), doc_pretty, font=docnum_font, fill=NAVY)
 
     # ── QR-код зі значком «KS» по центру — справжній, скановуваний ──
     # Стара рамка шаблону не квадратна (139×170) — «стираємо» її кольором фону
@@ -213,10 +218,13 @@ def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
     BG_MATCH = (234, 232, 236)
     draw.rectangle([778, 322, 925, 500], fill=BG_MATCH)
 
-    qr_data = f"KIBERSHKOLA-{passport_number}"
+    # QR кодує рівно той самий номер, що надрукований на документі.
+    # Якщо відомий username бота, QR відкриває безпечну перевірку саме цієї
+    # ліцензії в Telegram. Інакше зберігає номер як запасний варіант.
+    qr_data = verification_url or passport_number
     qr_box_size = 150
     qr_img = make_qr(qr_data, size=qr_box_size, logo_text="KS")
-    qr_cx, qr_cy = 851, 411  # центр колишньої рамки
+    qr_cx, qr_cy = RIGHT_COLUMN_CENTER_X, 411
     qr_x = qr_cx - qr_box_size // 2
     qr_y = qr_cy - qr_box_size // 2
 
@@ -232,11 +240,91 @@ def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
     buf.seek(0)
     return buf
 SHEET_ID = "1f61HYd4MQQnBj6z-mWrZ-2arn0r6r9WWbYJ4vphPY1s"
+SURVEY_SHEET_TITLE = "Анкети — повні дані"
+LICENSE_REGISTRY_TITLE = "Реєстр ліцензій"
+SURVEY_COLUMNS = [
+    ("submitted_at", "Дата й час проходження"),
+    ("passport_number", "№ паспорта спортсмена"),
+    ("parental_consent", "Згода батьків / законного представника"),
+    ("gender", "П1. Стать"),
+    ("contact_name", "П2. Ім’я та прізвище"),
+    ("birth_date", "П3. Дата народження"),
+    ("region", "П4. Область"),
+    ("city_name", "П5. Населений пункт"),
+    ("district", "П6. Район міста"),
+    ("school_type", "П7. Тип школи"),
+    ("school_name", "П8. Назва або номер школи"),
+    ("grade", "П9–9б. Клас"),
+    ("sport_active", "П10. Заняття спортом"),
+    ("sport_type", "П11. Вид спорту"),
+    ("sport_level", "П12. Рівень занять спортом"),
+    ("sport_coach", "П13. Наявність тренера"),
+    ("sport_why_not", "П11а. Чому не займається спортом"),
+    ("sport_would_like", "П11б. Бажаний вид спорту"),
+    ("watch_sport", "П14. Перегляд спорту"),
+    ("watch_where", "П15. Де переглядає спорт"),
+    ("fav_sport_watch", "П16. Улюблений спорт для перегляду"),
+    ("phys_ed", "П17. Ставлення до фізкультури"),
+    ("phys_out", "П18. Активність поза школою"),
+    ("pc_play", "П19. Грає на ПК"),
+    ("pc_hours", "П20. Години гри на ПК"),
+    ("pc_genre", "П21. Жанр ігор на ПК"),
+    ("pc_game", "П22. Гра на ПК"),
+    ("pc_compete", "П23. Змагання на ПК"),
+    ("pc_level", "П24. Рівень гри на ПК"),
+    ("pc_club", "П25. Клуб / команда на ПК"),
+    ("console_play", "П26. Грає на консолі"),
+    ("console_model", "П27. Модель консолі"),
+    ("console_hours", "П28. Години гри на консолі"),
+    ("console_genre", "П29. Жанр ігор на консолі"),
+    ("console_game", "П30. Гра на консолі"),
+    ("console_compete", "П31. Змагання на консолі"),
+    ("console_club", "П32. Клуб / команда на консолі"),
+    ("mobile_play", "П33. Грає на мобільному"),
+    ("mobile_hours", "П34. Години гри на мобільному"),
+    ("game_brawl", "П35. Brawl Stars"),
+    ("game_roblox", "П36. Roblox"),
+    ("game_minecraft", "П37. Minecraft"),
+    ("game_clash", "П38. Clash Royale"),
+    ("game_hok", "П39. Honor of Kings"),
+    ("game_mlbb", "П40. Mobile Legends: Bang Bang"),
+    ("game_pubg", "П41. PUBG Mobile"),
+    ("mobile_other", "П42. Інша мобільна гра"),
+    ("mobile_genre", "П43. Жанр мобільних ігор"),
+    ("mobile_compete", "П44. Змагання в мобільних іграх"),
+    ("mobile_level", "П45. Рівень мобільної гри"),
+    ("mobile_club", "П46. Клуб / команда в мобільних іграх"),
+    ("esports_know", "П47. Обізнаність про кіберспорт"),
+    ("esports_watch", "П48. Перегляд кіберспорту"),
+    ("esports_watch_where", "П49. Де переглядає кіберспорт"),
+    ("esports_compete", "П50. Участь у кіберспортивних змаганнях"),
+    ("esports_team", "П51. Наявність кіберспортивної команди"),
+    ("motivation", "П52. Мотивація в іграх"),
+    ("esports_attract", "П53. Що приваблює в кіберспорті"),
+    ("time_ready", "П54. Готовність приділяти час клубу"),
+    ("toxic", "П55. Токсична поведінка"),
+    ("respect_rule", "П56. Важливість поваги"),
+    ("safe_feel", "П57. Що створює безпеку в клубі"),
+    ("club_join", "П58. Бажання вступити до клубу"),
+    ("club_role", "П59. Бажана роль у клубі"),
+    ("club_important", "П60. Найважливіше у клубі"),
+    ("parents_support", "П61. Підтримка батьків"),
+    ("parents_allow", "П62. Дозвіл на тренування після уроків"),
+    ("future", "П63. Бажання пов’язати майбутнє з кіберспортом"),
+    ("future_role", "П64. Бажана майбутня професія"),
+]
+SURVEY_COLUMN_INDEX = {key: index for index, (key, _title) in enumerate(SURVEY_COLUMNS)}
+SURVEY_HEADERS = [title for _key, title in SURVEY_COLUMNS]
+LICENSE_HEADERS = [
+    "Номер ліцензії", "Статус", "ПІБ", "Школа", "Клас", "Нік",
+    "Тип ліцензії", "Видано", "Дійсна до", "Оновлено",
+]
 
 _gsheet = None
+_license_registry = None
 
 def get_sheet():
-    """Повертає з'єднання з Google Таблицею (кешується)."""
+    """Повертає повний лист анкети; старий перший лист лишається архівом."""
     global _gsheet
     if _gsheet is None:
         try:
@@ -253,97 +341,236 @@ def get_sheet():
                 creds_file = os.environ.get("GOOGLE_CREDS_FILE", "credentials.json")
                 creds = Credentials.from_service_account_file(creds_file, scopes=scopes)
             client = gspread.authorize(creds)
-            _gsheet = client.open_by_key(SHEET_ID).sheet1
+            spreadsheet = client.open_by_key(SHEET_ID)
+            try:
+                _gsheet = spreadsheet.worksheet(SURVEY_SHEET_TITLE)
+            except gspread.WorksheetNotFound:
+                _gsheet = spreadsheet.add_worksheet(
+                    title=SURVEY_SHEET_TITLE, rows=1000, cols=len(SURVEY_HEADERS)
+                )
+                _gsheet.append_row(SURVEY_HEADERS)
+                _gsheet.freeze(rows=1)
         except Exception as e:
             logging.error(f"Не вдалося підключитись до Google Sheets: {e}")
             _gsheet = False
     return _gsheet
 
-def _letter_series(n):
-    """0→A, 1→B, ..., 25→Z, 26→AA, 27→AB, ... (як нумерація колонок в Excel)."""
-    n += 1
-    result = ""
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        result = chr(65 + rem) + result
-    return result
+def get_license_registry():
+    """Повертає окремий, безпечний для верифікації реєстр ліцензій."""
+    global _license_registry
+    if _license_registry is not None:
+        return _license_registry
 
-def get_next_document_number():
-    """
-    Номер посвідчення: РІК-СЕРІЯ-НОМЕР, наприклад 26-00-0001.
-    - Перші 2 цифри — рік заповнення (26 = 2026), береться з поточної дати,
-      тому щороку нумерація логічно починається заново.
-    - Далі 00-0001 ... 99-9999 (послідовно, ~млн можливих номерів на рік).
-    - Якщо за рік дітей стане більше — додається літера-серія: A-26-00-0001,
-      далі B, C ... Z, а якщо і літер не вистачить — подвійні: AA, AB ...
-    Рахує вже заповнені за ПОТОЧНИЙ РІК рядки в Google Таблиці, щоб визначити
-    наступний порядковий номер. Якщо Таблиця недоступна — випадковий запасний
-    варіант, щоб бот не падав.
-    """
-    now = datetime.datetime.now()
-    yy = now.strftime("%y")
-    seq = 1
-
-    sheet = get_sheet()
-    if sheet:
+    survey_sheet = get_sheet()
+    if not survey_sheet:
+        return False
+    try:
+        spreadsheet = survey_sheet.spreadsheet
         try:
-            all_rows = sheet.get_all_values()
-            data_rows = all_rows[1:] if len(all_rows) > 1 else []
-            year_prefix = now.strftime("%Y-")
-            seq = sum(1 for row in data_rows if row and row[0].startswith(year_prefix)) + 1
-        except Exception as e:
-            logging.error(f"Не вдалося визначити номер документа: {e}")
-            import random
-            seq = random.randint(1, 999999)
+            registry = spreadsheet.worksheet(LICENSE_REGISTRY_TITLE)
+        except gspread.WorksheetNotFound:
+            registry = spreadsheet.add_worksheet(
+                title=LICENSE_REGISTRY_TITLE, rows=1000, cols=len(LICENSE_HEADERS)
+            )
 
-    MAX_PER_LETTER = 99 * 9999  # ~990 тис. номерів на одну «літерну» серію за рік
+        if not registry.get_all_values():
+            registry.append_row(LICENSE_HEADERS)
+            registry.freeze(rows=1)
+        _license_registry = registry
+    except Exception as e:
+        logging.error(f"Не вдалося підключити реєстр ліцензій: {e}")
+        _license_registry = False
+    return _license_registry
 
-    if seq <= MAX_PER_LETTER:
-        idx = seq - 1
-        nn = idx // 9999
-        nnnn = (idx % 9999) + 1
-        return f"{yy}-{nn:02d}-{nnnn:04d}"
-    else:
-        overflow_idx = seq - MAX_PER_LETTER - 1
-        letter_block = overflow_idx // MAX_PER_LETTER
-        rem = overflow_idx % MAX_PER_LETTER
-        nn = rem // 9999
-        nnnn = (rem % 9999) + 1
-        letter = _letter_series(letter_block)
-        return f"{letter}-{yy}-{nn:02d}-{nnnn:04d}"
+def add_one_year(date_value: datetime.date) -> datetime.date:
+    """Безпечно додає рік, зокрема для 29 лютого."""
+    try:
+        return date_value.replace(year=date_value.year + 1)
+    except ValueError:
+        return date_value.replace(year=date_value.year + 1, month=2, day=28)
 
-def save_to_sheet(answers: dict):
-    """Записує один рядок відповідей у Google Таблицю."""
+def upsert_license_record(answers: dict, passport_number: str) -> bool:
+    """Зберігає лише дані, які дозволено показувати під час QR-перевірки."""
+    registry = get_license_registry()
+    if not registry:
+        return False
+
+    issued = datetime.date.today()
+    valid_until = add_one_year(issued)
+    school_raw = answers.get("school_name", "—")
+    school = f"ШКОЛА № {school_raw}" if school_raw.strip().isdigit() else school_raw
+    record = [
+        passport_number,
+        "Дійсна",
+        answers.get("contact_name", "—"),
+        school,
+        str(answers.get("grade", "—")),
+        answers.get("nickname", "—"),
+        "Гравець",
+        issued.strftime("%d.%m.%Y"),
+        valid_until.strftime("%d.%m.%Y"),
+        datetime.datetime.now().strftime("%d.%m.%Y %H:%M"),
+    ]
+    try:
+        rows = registry.get_all_values()
+        for row_index, row in enumerate(rows[1:], start=2):
+            if row and row[0] == passport_number:
+                registry.update(f"A{row_index}:J{row_index}", [record])
+                return True
+        registry.append_row(record)
+        return True
+    except Exception as e:
+        logging.error(f"Не вдалося записати ліцензію в реєстр: {e}")
+        return False
+
+def make_verification_url(bot_username: str, passport_number: str) -> str:
+    """Формує Telegram deep-link для безпечної перевірки однієї ліцензії."""
+    username = (bot_username or "").lstrip("@").strip()
+    if not username:
+        return ""
+    return f"https://t.me/{username}?start=verify_{passport_number}"
+
+async def verify_license(update: Update, passport_number: str):
+    """Показує тільки безпечні дані конкретної ліцензії, а не анкету."""
+    registry = get_license_registry()
+    if not registry:
+        await update.message.reply_text("⚠️ Реєстр тимчасово недоступний. Спробуйте пізніше.")
+        return ConversationHandler.END
+    try:
+        rows = registry.get_all_values()
+    except Exception:
+        await update.message.reply_text("⚠️ Не вдалося перевірити ліцензію. Спробуйте пізніше.")
+        return ConversationHandler.END
+
+    for row in rows[1:]:
+        if row and row[0] == passport_number:
+            values = (row + [""] * len(LICENSE_HEADERS))[:len(LICENSE_HEADERS)]
+            number, status, full_name, school, grade, nick, license_type, issued, valid_until, _updated = values
+            try:
+                is_active = status == "Дійсна" and datetime.datetime.strptime(valid_until, "%d.%m.%Y").date() >= datetime.date.today()
+            except ValueError:
+                is_active = False
+            if is_active:
+                await update.message.reply_text(
+                    "✅ *Ліцензія дійсна*\n\n"
+                    f"№ {number}\n{full_name}\n{school}, {grade} клас\n"
+                    f"Тип: {license_type}\nВидано: {issued}\nДійсна до: {valid_until}",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    f"⛔ *Ліцензія недійсна*\n\n№ {number}", parse_mode="Markdown"
+                )
+            return ConversationHandler.END
+
+    await update.message.reply_text("⛔ Ліцензію з таким номером не знайдено.")
+    return ConversationHandler.END
+
+DOCUMENT_NUMBER_RE = re.compile(r"^([A-Z]{2})-(\d{2})-(\d{2})-(\d{4})$")
+DOCUMENTS_PER_BLOCK = 9_999
+BLOCKS_PER_SERIES = 100
+DOCUMENTS_PER_SERIES = BLOCKS_PER_SERIES * DOCUMENTS_PER_BLOCK
+DOCUMENT_ISSUE_LOCK = asyncio.Lock()
+
+def _series_for_index(index: int) -> str:
+    """0 → AA, 1 → AB, ... 25 → AZ, 26 → BA."""
+    if index < 0:
+        raise ValueError("Індекс серії не може бути від’ємним")
+    return f"{chr(65 + index // 26)}{chr(65 + index % 26)}"
+
+def _series_index(series: str) -> int:
+    """AA → 0, AB → 1, ... BA → 26."""
+    if len(series) != 2 or not series.isalpha() or not series.isupper():
+        raise ValueError(f"Некоректна серія документа: {series}")
+    return (ord(series[0]) - 65) * 26 + (ord(series[1]) - 65)
+
+def _parse_document_number(value: str):
+    """Повертає (серія, рік, блок, порядковий номер) або None для старих форматів."""
+    match = DOCUMENT_NUMBER_RE.fullmatch((value or "").strip())
+    if not match:
+        return None
+    series, year, block, serial = match.groups()
+    block_number = int(block)
+    serial_number = int(serial)
+    if not 0 <= block_number < BLOCKS_PER_SERIES or not 1 <= serial_number <= DOCUMENTS_PER_BLOCK:
+        return None
+    return series, int(year), block_number, serial_number
+
+def _normalise_identity(value: str) -> str:
+    return " ".join((value or "").strip().casefold().split())
+
+def _same_participant(row: list[str], answers: dict) -> bool:
+    """Ідентифікація повторної видачі: ПІБ + дата народження."""
+    return (
+        len(row) > SURVEY_COLUMN_INDEX["birth_date"]
+        and _normalise_identity(row[SURVEY_COLUMN_INDEX["contact_name"]]) == _normalise_identity(answers.get("contact_name", ""))
+        and _normalise_identity(row[SURVEY_COLUMN_INDEX["birth_date"]]) == _normalise_identity(answers.get("birth_date", ""))
+    )
+
+def get_document_number(answers: dict, issue_year: int | None = None) -> str:
+    """
+    Видає номер у форматі AA-26-00-0001.
+
+    Нова людина одержує наступний вільний номер: AA-26-00-0001…AA-26-99-9999,
+    потім AB-26-00-0001 і так далі. Для повторного проходження тією самою
+    людиною зберігаються серія та порядковий номер; змінюється лише рік.
+    """
+    year = (issue_year or datetime.date.today().year) % 100
     sheet = get_sheet()
     if not sheet:
-        return
+        raise RuntimeError("Неможливо видати паспорт без доступу до реєстру номерів")
+
+    try:
+        all_rows = sheet.get_all_values()
+    except Exception as e:
+        raise RuntimeError("Неможливо прочитати реєстр номерів") from e
+
+    data_rows = all_rows[1:] if len(all_rows) > 1 else []
+
+    # Спочатку шукаємо попередню ліцензію цієї людини. Беремо найновіший рядок.
+    for row in reversed(data_rows):
+        if _same_participant(row, answers) and len(row) > SURVEY_COLUMN_INDEX["passport_number"]:
+            parsed = _parse_document_number(row[SURVEY_COLUMN_INDEX["passport_number"]])
+            if parsed:
+                series, _old_year, block, serial = parsed
+                return f"{series}-{year:02d}-{block:02d}-{serial:04d}"
+
+    # Для нового учасника наступний номер визначається за найбільшим уже
+    # виданим серійним номером незалежно від року — номери не повторюються.
+    largest_sequence = 0
+    for row in data_rows:
+        if len(row) <= SURVEY_COLUMN_INDEX["passport_number"]:
+            continue
+        parsed = _parse_document_number(row[SURVEY_COLUMN_INDEX["passport_number"]])
+        if parsed:
+            series, _doc_year, block, serial = parsed
+            largest_sequence = max(
+                largest_sequence,
+                _series_index(series) * DOCUMENTS_PER_SERIES + block * DOCUMENTS_PER_BLOCK + serial,
+            )
+
+    next_sequence = largest_sequence + 1
+    series_index, series_offset = divmod(next_sequence - 1, DOCUMENTS_PER_SERIES)
+    block, serial_offset = divmod(series_offset, DOCUMENTS_PER_BLOCK)
+    return f"{_series_for_index(series_index)}-{year:02d}-{block:02d}-{serial_offset + 1:04d}"
+
+def save_to_sheet(answers: dict):
+    """Записує повний набір відповідей строго у порядку питань бота."""
+    sheet = get_sheet()
+    if not sheet:
+        return False
     try:
         row = [
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-            answers.get("gender", ""),
-            answers.get("contact_name", ""),
-            answers.get("birth_date", ""),
-            answers.get("grade", ""),
-            answers.get("region", ""),
-            answers.get("city_type", ""),
-            answers.get("city_name", ""),
-            answers.get("district", ""),
-            answers.get("school_type", ""),
-            answers.get("school_name", ""),
-            answers.get("sport_active", ""),
-            answers.get("sport_type", answers.get("sport_why_not", "")),
-            answers.get("esports_know", ""),
-            answers.get("clubJoin", answers.get("club_join", "")),
-            answers.get("clubRole", answers.get("club_role", "")),
-            answers.get("ticket", ""),
-            answers.get("parent_name", ""),
-            answers.get("contact_phone", ""),
-            answers.get("passport_number", ""),
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M") if key == "submitted_at"
+            else answers.get(key, "")
+            for key, _title in SURVEY_COLUMNS
         ]
         sheet.append_row(row)
         logging.info("Рядок записано у Google Таблицю")
+        return True
     except Exception as e:
         logging.error(f"Помилка запису у Google Sheets: {e}")
+        return False
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -433,6 +660,14 @@ def grade_int(ctx):
 
 # ── СТАРТ ──────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # QR відкриває бота з параметром verify_AA-26-00-0001.
+    if ctx.args and ctx.args[0].startswith("verify_"):
+        passport_number = ctx.args[0][len("verify_"):].upper()
+        if DOCUMENT_NUMBER_RE.fullmatch(passport_number):
+            return await verify_license(update, passport_number)
+        await update.message.reply_text("⛔ Некоректний номер ліцензії.")
+        return ConversationHandler.END
+
     ctx.user_data.clear()
     await update.message.reply_text(
         "👋 Привіт!\n\n"
@@ -452,6 +687,7 @@ async def consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove()
         )
         return ConversationHandler.END
+    save(ctx, "parental_consent", "Надано")
     await update.message.reply_text(
         "Чудово! Починаємо 🚀\n\n*П1. Яка твоя стать?*",
         parse_mode="Markdown",
@@ -1006,9 +1242,20 @@ async def future_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not passport_data.get("contact_name"):
             passport_data["contact_name"] = f"{tg_user.first_name or ''} {tg_user.last_name or ''}".strip() or "Гравець"
         passport_data["nickname"] = f"@{tg_user.username}" if tg_user.username else "—"
-        passport_number = get_next_document_number()
-        save(ctx, "passport_number", passport_number)
-        photo_buf = generate_passport(passport_data, passport_number)
+        # Номер резервуємо у реєстрі до відправлення файлу. Це не дозволяє
+        # двом відповідям в одному процесі одержати однаковий номер.
+        async with DOCUMENT_ISSUE_LOCK:
+            passport_number = get_document_number(passport_data)
+            save(ctx, "passport_number", passport_number)
+            if not save_to_sheet(ctx.user_data):
+                raise RuntimeError("Не вдалося зберегти виданий номер у реєстрі")
+            if not upsert_license_record(passport_data, passport_number):
+                raise RuntimeError("Не вдалося зберегти ліцензію в реєстрі")
+            save(ctx, "response_saved", True)
+
+        bot_profile = await ctx.bot.get_me()
+        verification_url = make_verification_url(bot_profile.username, passport_number)
+        photo_buf = generate_passport(passport_data, passport_number, verification_url)
         await update.message.reply_photo(
             photo=photo_buf,
             caption=f"🎫 *Твій паспорт гравця* {passport_number}\n\nЗбережи собі на телефон!",
@@ -1042,7 +1289,8 @@ async def _finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     logger.info(f"DONE uid={update.effective_user.id} data={d}")
-    save_to_sheet(d)
+    if not d.get("response_saved"):
+        save_to_sheet(d)
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

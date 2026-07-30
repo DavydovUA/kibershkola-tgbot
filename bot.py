@@ -386,7 +386,7 @@ async def verify_license(update: Update, passport_number: str):
         await update.message.reply_text("⛔ Ліцензію з таким номером не знайдено.")
         return ConversationHandler.END
 
-    is_active = row["status"] == "active" and row["valid_until"] >= datetime.date.today()
+    is_active = row["status"] == "Дійсна" and row["valid_until"] >= datetime.date.today()
     if is_active:
         await update.message.reply_text(
             "✅ *Ліцензія дійсна*\n\n"
@@ -407,7 +407,6 @@ BLOCKS_PER_SERIES = 100
 DOCUMENTS_PER_SERIES = BLOCKS_PER_SERIES * DOCUMENTS_PER_BLOCK
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-LICENSE_PEPPER = os.environ.get("LICENSE_PEPPER", "")
 db_pool = None  # ініціалізується при старті бота (post_init)
 
 def _series_for_index(index: int) -> str:
@@ -426,14 +425,18 @@ def _decode_sequence(seq: int):
 def _normalise_identity(value: str) -> str:
     return " ".join((value or "").strip().casefold().split())
 
+LICENSE_PEPPER = os.environ.get("LICENSE_PEPPER", "")
+
 def make_participant_key(answers: dict) -> str:
-    """Постійний, але незворотний ключ дитини для повторної видачі ліцензії."""
+    """
+    Постійний ключ дитини: SHA-256 від (ПІБ + дата народження + секретна сіль).
+    Хешується, щоб у базі даних не зберігався прямий, читабельний зв'язок
+    між ідентифікацією дитини і виданим номером.
+    """
     name = _normalise_identity(answers.get("contact_name", ""))
     bdate = _normalise_identity(answers.get("birth_date", ""))
-    if not LICENSE_PEPPER:
-        raise RuntimeError("LICENSE_PEPPER не задано")
-    raw = f"{name}|{bdate}|{LICENSE_PEPPER}".encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+    raw = f"{name}|{bdate}|{LICENSE_PEPPER}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 async def init_db(app):
     """Створює пул з'єднань з PostgreSQL при старті бота."""
@@ -441,8 +444,6 @@ async def init_db(app):
     if not DATABASE_URL:
         logging.error("DATABASE_URL не задано — видача номерів працювати не буде")
         return
-    if not LICENSE_PEPPER:
-        raise RuntimeError("LICENSE_PEPPER не задано — запуск зупинено з міркувань безпеки")
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     logging.info("✅ Підключення до PostgreSQL встановлено")
 
@@ -455,57 +456,59 @@ async def get_or_create_license(participant_key: str, answers: dict) -> str:
     """
     Атомарно видає номер посвідчення у форматі AA-26-00-0001.
 
-    Нова дитина отримує наступний вільний номер через PostgreSQL SEQUENCE —
-    це гарантовано унікально, навіть якщо сотні запитів прийдуть одночасно.
-    Дитина, що вже проходила опитування раніше (той самий ПІБ + дата
+    Використовує `INSERT ... ON CONFLICT (participant_key) DO NOTHING`,
+    що на рівні самого PostgreSQL (не Python) гарантує: навіть якщо той
+    самий НОВИЙ учасник надішле анкету одночасно з двох пристроїв, лише
+    один запит справді створить рядок, а другий безпечно побачить вже
+    існуючий і просто прочитає його номер — без помилок і без дублів.
+
+    Дитина, що вже проходила опитування раніше (той самий хеш ПІБ+дата
     народження), отримує ТОЙ САМИЙ номер — змінюється лише рік.
     """
     if db_pool is None:
         raise RuntimeError("Немає з'єднання з базою даних")
 
     year = datetime.date.today().year % 100
-    issued = datetime.date.today()
-    valid_until = add_one_year(issued)
+    valid_until = add_one_year(datetime.date.today())
 
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            # Серіалізує лише повторні запити однієї людини. PostgreSQL sequence
-            # безпечно видає номери також при кількох процесах бота.
-            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", participant_key)
-            row = await conn.fetchrow(
-                "SELECT sequence_number FROM licenses WHERE participant_key = $1 FOR UPDATE",
-                participant_key
+            # Атомарна спроба створити новий рядок. Якщо ключ вже існує —
+            # PostgreSQL сам, на рівні унікального індексу, не дасть створити
+            # дублікат: DO NOTHING просто нічого не поверне.
+            seq = await conn.fetchval(
+                """
+                INSERT INTO licenses
+                    (participant_key, sequence_number, series, year, block,
+                     serial, passport_number, valid_until)
+                VALUES ($1, nextval('license_sequence'), '', '', '', '', '', $2)
+                ON CONFLICT (participant_key) DO NOTHING
+                RETURNING sequence_number
+                """,
+                participant_key, valid_until
             )
-            if row is not None:
-                seq = row["sequence_number"]
-                series, block, serial = _decode_sequence(seq)
-                passport_number = f"{series}-{year:02d}-{block:02d}-{serial:04d}"
-                await conn.execute(
-                    """UPDATE licenses SET year=$1, issued_at=$2, valid_until=$3,
-                       status='active', updated_at=now(), full_name=$4, school=$5,
-                       grade=$6, nickname=$7, passport_number=$8
-                       WHERE participant_key=$9""",
-                    year, issued, valid_until, answers.get("contact_name", ""),
-                    answers.get("school_name", ""), str(answers.get("grade", "")),
-                    answers.get("nickname", ""), passport_number, participant_key
+            if seq is None:
+                # Учасник вже існував — забираємо його постійний номер
+                seq = await conn.fetchval(
+                    "SELECT sequence_number FROM licenses WHERE participant_key = $1",
+                    participant_key
                 )
-                return passport_number
 
-            seq = await conn.fetchval("SELECT nextval('license_sequence')")
             series, block, serial = _decode_sequence(seq)
             passport_number = f"{series}-{year:02d}-{block:02d}-{serial:04d}"
+
             await conn.execute(
-                """INSERT INTO licenses
-                   (participant_key, sequence_number, series, year, block, serial,
-                    passport_number, full_name, school, grade, nickname, status,
-                    issued_at, valid_until)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13)""",
-                participant_key, seq, series, year, block, serial,
-                passport_number, answers.get("contact_name", ""),
-                answers.get("school_name", ""), str(answers.get("grade", "")),
-                answers.get("nickname", ""), issued, valid_until
+                """UPDATE licenses SET
+                       series=$1, year=$2, block=$3, serial=$4, passport_number=$5,
+                       full_name=$6, school=$7, grade=$8, nickname=$9,
+                       valid_until=$10, updated_at=now()
+                   WHERE participant_key=$11""",
+                series, str(year), str(block), str(serial), passport_number,
+                answers.get("contact_name", ""), answers.get("school_name", ""),
+                str(answers.get("grade", "")), answers.get("nickname", ""),
+                valid_until, participant_key
             )
-            return passport_number
+    return passport_number
 
 def save_to_sheet(answers: dict):
     """Записує повний набір відповідей строго у порядку питань бота."""
@@ -1279,6 +1282,7 @@ def main():
         .token(TOKEN)
         .post_init(init_db)
         .post_shutdown(close_db)
+        .concurrent_updates(True)  # обробляти різних дітей паралельно, а не по черзі
         .build()
     )
     conv = ConversationHandler(

@@ -633,6 +633,14 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return CONSENT
 
+async def myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показує числовий chat_id для підключення службових сповіщень."""
+    await update.message.reply_text(
+        f"Ваш Telegram chat_id: `{update.effective_chat.id}`\n\n"
+        "Надішліть це число адміністратору бота.",
+        parse_mode="Markdown"
+    )
+
 async def consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text.startswith("❌"):
         await update.message.reply_text(
@@ -1281,6 +1289,7 @@ def main():
         .post_shutdown(close_db)
         .build()
     )
+    app.add_handler(CommandHandler("myid", myid))
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={

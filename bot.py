@@ -79,23 +79,78 @@ TEMPLATE_PATH = "templates/passport_template.png"
 
 NAVY = (16, 34, 74)
 GRAY_TEXT = (110, 120, 140)
+SILHOUETTE_BLUE = (150, 175, 215)
 
 def font(size, bold=False):
     path = f"{FONT_DIR}/DejaVuSans-Bold.ttf" if bold else f"{FONT_DIR}/DejaVuSans.ttf"
     return ImageFont.truetype(path, size)
 
-def get_initials(name):
-    parts = (name or "").strip().split()
-    if len(parts) >= 2:
-        return (parts[0][0] + parts[1][0]).upper()
-    return (name[:2] if name else "??").upper()
+# ── Транслітерація українською → англійською (офіційна система) ──
+_TRANSLIT_MAP = {
+    "а":"a","б":"b","в":"v","г":"h","ґ":"g","д":"d","е":"e","є":"ie","ж":"zh",
+    "з":"z","и":"y","і":"i","ї":"i","й":"i","к":"k","л":"l","м":"m","н":"n",
+    "о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"kh","ц":"ts",
+    "ч":"ch","ш":"sh","щ":"shch","ь":"","ю":"iu","я":"ia","'":"","’":"",
+}
+_TRANSLIT_FIRST = {"є":"Ye","ї":"Yi","й":"Y","ю":"Yu","я":"Ya"}
 
-def make_qr(data, size=130):
-    qr = qrcode.QRCode(border=1, box_size=6)
+def transliterate(text):
+    if not text:
+        return ""
+    words = text.split()
+    out_words = []
+    for w in words:
+        chars = []
+        for i, ch in enumerate(w):
+            low = ch.lower()
+            if i == 0 and low in _TRANSLIT_FIRST:
+                piece = _TRANSLIT_FIRST[low]
+            else:
+                piece = _TRANSLIT_MAP.get(low, ch)
+            if ch.isupper() and piece:
+                piece = piece[0].upper() + piece[1:]
+            chars.append(piece)
+        out_words.append("".join(chars))
+    return " ".join(out_words)
+
+def make_qr(data, size=170, logo_text="KS"):
+    """Генерує QR з високим рівнем корекції помилок, щоб витримати логотип по центру."""
+    qr = qrcode.QRCode(border=1, box_size=8, error_correction=qrcode.constants.ERROR_CORRECT_H)
     qr.add_data(data)
     qr.make(fit=True)
     img = qr.make_image(fill_color=NAVY, back_color="white").convert("RGB")
-    return img.resize((size, size))
+    img = img.resize((size, size))
+
+    # Значок-щит з написом "KS" по центру QR
+    draw = ImageDraw.Draw(img)
+    shield_r = size // 7
+    ccx, ccy = size // 2, size // 2
+    draw.ellipse([ccx-shield_r-6, ccy-shield_r-6, ccx+shield_r+6, ccy+shield_r+6], fill="white")
+    draw.ellipse([ccx-shield_r, ccy-shield_r, ccx+shield_r, ccy+shield_r], fill=NAVY)
+    lf = font(shield_r, bold=True)
+    lb = draw.textbbox((0,0), logo_text, font=lf)
+    lw, lh = lb[2]-lb[0], lb[3]-lb[1]
+    draw.text((ccx-lw/2, ccy-lh/2-lb[1]), logo_text, font=lf, fill="white")
+    return img
+
+def draw_silhouette(draw, box):
+    """Малює нейтральний силует людини (аватар-заглушка) замість реального фото."""
+    x0, y0, x1, y1 = box
+    w, h = x1-x0, y1-y0
+    cx = (x0+x1)//2
+
+    # Голова
+    head_r = w * 0.19
+    head_cy = y0 + h*0.34
+    draw.ellipse([cx-head_r, head_cy-head_r, cx+head_r, head_cy+head_r], fill=SILHOUETTE_BLUE)
+
+    # Плечі/тулуб — половина еліпса, обрізана рамкою фото
+    shoulder_w = w * 0.62
+    shoulder_top = y0 + h*0.56
+    draw.ellipse([cx-shoulder_w/2, shoulder_top, cx+shoulder_w/2, shoulder_top + shoulder_w*0.9],
+                 fill=SILHOUETTE_BLUE)
+    # Прямокутник щоб «дообрізати» низ силуету по межі фото-блоку
+    draw.rectangle([x0, min(y1-2, shoulder_top+shoulder_w*0.55), x1, y1], fill=None)
 
 def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
     """
@@ -107,31 +162,34 @@ def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
     img = Image.open(TEMPLATE_PATH).convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # ── Фото: ініціали замість реального фото (приватність дітей) ──
+    # ── Фото: нейтральний силует замість реального фото (приватність дітей) ──
     photo_box = [88, 135, 290, 388]
-    initials = get_initials(answers.get("contact_name", ""))
-    init_font = font(62, bold=True)
-    ib = draw.textbbox((0, 0), initials, font=init_font)
-    iw, ih = ib[2]-ib[0], ib[3]-ib[1]
-    cx = (photo_box[0]+photo_box[2])//2
-    cy = (photo_box[1]+photo_box[3])//2 - 15
-    draw.text((cx-iw/2, cy-ih/2), initials, font=init_font, fill=(90, 130, 210))
+    draw_silhouette(draw, photo_box)
 
-    # ── Дані у правому інфо-стовпчику (координати виміряні по шаблону) ──
-    value_font = font(24, bold=True)
-    col_x = 352
+    # ── Дані у правому інфо-стовпчику ──
+    col_x = 384  # +32px відступ від лівого краю поля (виміряно з еталону)
 
+    # Ім'я ВЕЛИКИМИ ЛІТЕРАМИ + транслітерація англійською під ним
     name = answers.get("contact_name", "—")
-    draw.text((col_x, 224), name, font=value_font, fill=NAVY)
+    name_upper = name.upper()
+    name_font = font(24, bold=True)
+    # Якщо ім'я задовге — трохи зменшуємо шрифт, щоб не вилазило за лінію
+    nb = draw.textbbox((0,0), name_upper, font=name_font)
+    if nb[2]-nb[0] > 295:
+        name_font = font(19, bold=True)
+    draw.text((col_x, 210), name_upper, font=name_font, fill=NAVY)
+    translit = transliterate(name).upper()
+    draw.text((col_x, 240), translit, font=font(12), fill=GRAY_TEXT)
 
     nick = answers.get("nickname") or "—"
-    draw.text((col_x, 310), nick, font=font(19), fill=NAVY)
+    draw.text((col_x, 326), nick, font=font(19), fill=NAVY)
 
-    school = answers.get("school_name", "—")
-    draw.text((col_x, 396), school, font=font(19), fill=NAVY)
+    school_raw = answers.get("school_name", "—")
+    school = f"ШКОЛА № {school_raw}" if school_raw.strip().isdigit() else school_raw
+    draw.text((col_x, 413), school, font=font(19), fill=NAVY)
 
     grade = answers.get("grade", "—")
-    draw.text((col_x, 483), str(grade), font=font(19), fill=NAVY)
+    draw.text((col_x, 500), str(grade), font=font(19), fill=NAVY)
 
     # ── Дати: Видано / Дійсна до ──
     issued = datetime.date.today()
@@ -140,15 +198,34 @@ def generate_passport(answers: dict, passport_number: str) -> io.BytesIO:
     draw.text((65, 542), issued.strftime("%d.%m.%Y"), font=date_font, fill=NAVY)
     draw.text((208, 542), valid_until.strftime("%d.%m.%Y"), font=date_font, fill=NAVY)
 
-    # ── № документа ──
+    # ── № документа — через крапки, наприклад 26 • 00 • 0001 (або A • 26 • 00 • 0001) ──
+    doc_pretty = passport_number.replace("-", " • ")
     docnum_font = font(16, bold=True)
-    dn = draw.textbbox((0, 0), passport_number, font=docnum_font)
-    draw.text((852 - (dn[2]-dn[0])/2, 282), passport_number, font=docnum_font, fill=NAVY)
+    dn = draw.textbbox((0, 0), doc_pretty, font=docnum_font)
+    if dn[2]-dn[0] > 150:
+        docnum_font = font(13, bold=True)
+        dn = draw.textbbox((0, 0), doc_pretty, font=docnum_font)
+    draw.text((852 - (dn[2]-dn[0])/2, 284), doc_pretty, font=docnum_font, fill=NAVY)
 
-    # ── QR-код — справжній, скановуваний, вставлений у фіксовану рамку шаблону ──
+    # ── QR-код зі значком «KS» по центру — справжній, скановуваний ──
+    # Стара рамка шаблону не квадратна (139×170) — «стираємо» її кольором фону
+    # і малюємо нову, точно квадратну, рамку по контуру самого QR
+    BG_MATCH = (234, 232, 236)
+    draw.rectangle([778, 322, 925, 500], fill=BG_MATCH)
+
     qr_data = f"KIBERSHKOLA-{passport_number}"
-    qr_img = make_qr(qr_data, size=130)
-    img.paste(qr_img, (786, 330))
+    qr_box_size = 150
+    qr_img = make_qr(qr_data, size=qr_box_size, logo_text="KS")
+    qr_cx, qr_cy = 851, 411  # центр колишньої рамки
+    qr_x = qr_cx - qr_box_size // 2
+    qr_y = qr_cy - qr_box_size // 2
+
+    pad = 6
+    draw.rectangle(
+        [qr_x - pad, qr_y - pad, qr_x + qr_box_size + pad, qr_y + qr_box_size + pad],
+        outline=NAVY, width=3
+    )
+    img.paste(qr_img, (qr_x, qr_y))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -182,6 +259,59 @@ def get_sheet():
             _gsheet = False
     return _gsheet
 
+def _letter_series(n):
+    """0→A, 1→B, ..., 25→Z, 26→AA, 27→AB, ... (як нумерація колонок в Excel)."""
+    n += 1
+    result = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+def get_next_document_number():
+    """
+    Номер посвідчення: РІК-СЕРІЯ-НОМЕР, наприклад 26-00-0001.
+    - Перші 2 цифри — рік заповнення (26 = 2026), береться з поточної дати,
+      тому щороку нумерація логічно починається заново.
+    - Далі 00-0001 ... 99-9999 (послідовно, ~млн можливих номерів на рік).
+    - Якщо за рік дітей стане більше — додається літера-серія: A-26-00-0001,
+      далі B, C ... Z, а якщо і літер не вистачить — подвійні: AA, AB ...
+    Рахує вже заповнені за ПОТОЧНИЙ РІК рядки в Google Таблиці, щоб визначити
+    наступний порядковий номер. Якщо Таблиця недоступна — випадковий запасний
+    варіант, щоб бот не падав.
+    """
+    now = datetime.datetime.now()
+    yy = now.strftime("%y")
+    seq = 1
+
+    sheet = get_sheet()
+    if sheet:
+        try:
+            all_rows = sheet.get_all_values()
+            data_rows = all_rows[1:] if len(all_rows) > 1 else []
+            year_prefix = now.strftime("%Y-")
+            seq = sum(1 for row in data_rows if row and row[0].startswith(year_prefix)) + 1
+        except Exception as e:
+            logging.error(f"Не вдалося визначити номер документа: {e}")
+            import random
+            seq = random.randint(1, 999999)
+
+    MAX_PER_LETTER = 99 * 9999  # ~990 тис. номерів на одну «літерну» серію за рік
+
+    if seq <= MAX_PER_LETTER:
+        idx = seq - 1
+        nn = idx // 9999
+        nnnn = (idx % 9999) + 1
+        return f"{yy}-{nn:02d}-{nnnn:04d}"
+    else:
+        overflow_idx = seq - MAX_PER_LETTER - 1
+        letter_block = overflow_idx // MAX_PER_LETTER
+        rem = overflow_idx % MAX_PER_LETTER
+        nn = rem // 9999
+        nnnn = (rem % 9999) + 1
+        letter = _letter_series(letter_block)
+        return f"{letter}-{yy}-{nn:02d}-{nnnn:04d}"
+
 def save_to_sheet(answers: dict):
     """Записує один рядок відповідей у Google Таблицю."""
     sheet = get_sheet()
@@ -191,6 +321,8 @@ def save_to_sheet(answers: dict):
         row = [
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
             answers.get("gender", ""),
+            answers.get("contact_name", ""),
+            answers.get("birth_date", ""),
             answers.get("grade", ""),
             answers.get("region", ""),
             answers.get("city_type", ""),
@@ -204,9 +336,9 @@ def save_to_sheet(answers: dict):
             answers.get("clubJoin", answers.get("club_join", "")),
             answers.get("clubRole", answers.get("club_role", "")),
             answers.get("ticket", ""),
-            answers.get("contact_name", ""),
             answers.get("parent_name", ""),
             answers.get("contact_phone", ""),
+            answers.get("passport_number", ""),
         ]
         sheet.append_row(row)
         logging.info("Рядок записано у Google Таблицю")
@@ -219,7 +351,7 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("BOT_TOKEN")
 
 (
-    CONSENT, GENDER, REGION, FULL_NAME, GRADE, GRADE_LETTER,
+    CONSENT, GENDER, REGION, FULL_NAME, BIRTH_DATE, GRADE, GRADE_LETTER,
     CITY_TYPE, CITY_SELECT, CITY_NAME, DISTRICT, SCHOOL_TYPE, SCHOOL_NAME,
     SPORT_ACTIVE, SPORT_TYPE, SPORT_LEVEL, SPORT_COACH,
     SPORT_WHY_NOT, SPORT_WOULD_LIKE,
@@ -237,7 +369,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
     CLUB_JOIN, CLUB_ROLE, CLUB_IMPORTANT, PARENTS_SUPPORT, PARENTS_ALLOW,
     FUTURE, FUTURE_ROLE,
     TICKET, PARENT_NAME, CONTACT_PHONE, CONTACT_TIME,
-) = range(73)
+) = range(74)
 
 # ── ДАНІ ПРО ОБЛАСТІ: ЦЕНТРИ ТА ВЕЛИКІ МІСТА ────────────────────
 OBLAST_CENTERS = {
@@ -340,7 +472,16 @@ async def gender(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def full_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "contact_name", update.message.text)
     await update.message.reply_text(
-        "*П3. Яка твоя область?*",
+        "*П3. Напиши дату свого народження у форматі ДД.ММ.РРРР*\n\n"
+        "_Наприклад: 15.03.2015_",
+        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
+    )
+    return BIRTH_DATE
+
+async def birth_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    save(ctx, "birth_date", update.message.text.strip())
+    await update.message.reply_text(
+        "*П4. Яка твоя область?*",
         parse_mode="Markdown",
         reply_markup=kb([
             "Вінницька","Волинська","Дніпропетровська","Донецька",
@@ -357,7 +498,7 @@ async def full_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def region(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "region", update.message.text)
     await update.message.reply_text(
-        "*П4. В якому ти класі?*",
+        "*П5. В якому ти класі?*",
         parse_mode="Markdown",
         reply_markup=kb(["3","4","5","6","7","8","9","10","11"])
     )
@@ -366,7 +507,7 @@ async def region(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def grade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "grade_number", update.message.text)
     await update.message.reply_text(
-        "*П4б. Буква класу?*",
+        "*П5б. Буква класу?*",
         parse_mode="Markdown",
         reply_markup=kb(["А","Б","В","Г","Немає букви"])
     )
@@ -380,7 +521,7 @@ async def grade_letter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         save(ctx, "grade", num)
     await update.message.reply_text(
-        "*П5. Де ти живеш?*\n\n"
+        "*П6. Де ти живеш?*\n\n"
         "Напиши перші 3-4 літери назви свого міста, селища або села — "
         "бот покаже список схожих варіантів, і ти обереш потрібний.\n\n"
         "_Наприклад: «Бров» → покаже Бровари_",
@@ -461,7 +602,7 @@ async def district(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def school_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "school_type", update.message.text)
     await update.message.reply_text(
-        "*П7. Назва або номер школи?*",
+        "*П8. Назва або номер школи?*",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
     return SCHOOL_NAME
@@ -488,7 +629,7 @@ async def sport_active(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def sport_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "sport_type", update.message.text)
     await update.message.reply_text("*П10. Де займаєшся спортом?*", parse_mode="Markdown",
-        reply_markup=kb(["Шкільна секція","Спортивний клуб","Міські змагання","Обласні змагання"]))
+        reply_markup=kb(["Шкільна секція","Спортивний клуб","Міські змагання","Обласні змагання","На вулиці"]))
     return SPORT_LEVEL
 
 async def sport_level(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -821,7 +962,7 @@ async def safe_feel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def club_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "club_join", update.message.text)
     await update.message.reply_text("*П56. Яка роль у клубі тобі цікава?*", parse_mode="Markdown",
-        reply_markup=kb(["Гравець","Стример / коментатор","Організатор турнірів","Контент-мейкер","Суддя / рефері","Спостерігач"]))
+        reply_markup=kb(["Гравець","Стример / коментатор","Організатор турнірів","Контент-мейкер","Суддя / рефері","Спостерігач","На даний момент не знаю"]))
     return CLUB_ROLE
 
 async def club_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -852,11 +993,31 @@ async def parents_allow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def future(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "future", update.message.text)
     await update.message.reply_text("*П61. Яка роль цікава як майбутня професія?*", parse_mode="Markdown",
-        reply_markup=kb(["Профі-гравець","Тренер команди","Менеджер / продюсер","Суддя / аналітик","Коментатор","Розробник ігор","Не планую"]))
+        reply_markup=kb(["Профі-гравець","Тренер команди","Менеджер / продюсер","Суддя / аналітик","Коментатор","Розробник ігор","Не планую","На даний момент не знаю"]))
     return FUTURE_ROLE
 
 async def future_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "future_role", update.message.text)
+
+    # Паспорт гравця — одразу після завершення основної анкети, як подарунок
+    try:
+        d = ctx.user_data
+        passport_data = dict(d)
+        tg_user = update.effective_user
+        if not passport_data.get("contact_name"):
+            passport_data["contact_name"] = f"{tg_user.first_name or ''} {tg_user.last_name or ''}".strip() or "Гравець"
+        passport_data["nickname"] = f"@{tg_user.username}" if tg_user.username else "—"
+        passport_number = get_next_document_number()
+        save(ctx, "passport_number", passport_number)
+        photo_buf = generate_passport(passport_data, passport_number)
+        await update.message.reply_photo(
+            photo=photo_buf,
+            caption=f"🎫 *Твій паспорт гравця* {passport_number}\n\nЗбережи собі на телефон!",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Не вдалося згенерувати паспорт: {e}")
+
     await update.message.reply_text(SUPPORT_TEXT, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     await update.message.reply_text(
         "*П62. Хочеш отримати квиток до кіберспортивного клубу або на найближчу подію?*",
@@ -906,23 +1067,6 @@ async def _finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
 
-    # Генеруємо і надсилаємо паспорт гравця
-    try:
-        passport_data = dict(d)
-        tg_user = update.effective_user
-        if not passport_data.get("contact_name"):
-            passport_data["contact_name"] = f"{tg_user.first_name or ''} {tg_user.last_name or ''}".strip() or "Гравець"
-        passport_data["nickname"] = f"@{tg_user.username}" if tg_user.username else "—"
-        passport_number = f"KS-2026-{update.effective_user.id % 10000:04d}"
-        photo_buf = generate_passport(passport_data, passport_number)
-        await update.message.reply_photo(
-            photo=photo_buf,
-            caption=f"🎫 *Твій паспорт гравця* {passport_number}\n\nЗбережи собі на телефон!",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Не вдалося згенерувати паспорт: {e}")
-
     logger.info(f"DONE uid={update.effective_user.id} data={d}")
     save_to_sheet(d)
     return ConversationHandler.END
@@ -942,6 +1086,7 @@ def main():
             GENDER:[MessageHandler(filters.TEXT&~filters.COMMAND,gender)],
             REGION:[MessageHandler(filters.TEXT&~filters.COMMAND,region)],
             FULL_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,full_name)],
+            BIRTH_DATE:[MessageHandler(filters.TEXT&~filters.COMMAND,birth_date)],
             GRADE:[MessageHandler(filters.TEXT&~filters.COMMAND,grade)],
             GRADE_LETTER:[MessageHandler(filters.TEXT&~filters.COMMAND,grade_letter)],
             CITY_TYPE:[MessageHandler(filters.TEXT&~filters.COMMAND,city_type)],

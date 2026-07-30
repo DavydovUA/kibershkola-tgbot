@@ -3,7 +3,9 @@ import os
 import datetime
 import asyncio
 import re
+import hashlib
 import httpx
+import asyncpg
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -241,7 +243,6 @@ def generate_passport(answers: dict, passport_number: str, verification_url: str
     return buf
 SHEET_ID = "1f61HYd4MQQnBj6z-mWrZ-2arn0r6r9WWbYJ4vphPY1s"
 SURVEY_SHEET_TITLE = "Анкети — повні дані"
-LICENSE_REGISTRY_TITLE = "Реєстр ліцензій"
 SURVEY_COLUMNS = [
     ("submitted_at", "Дата й час проходження"),
     ("passport_number", "№ паспорта спортсмена"),
@@ -315,13 +316,8 @@ SURVEY_COLUMNS = [
 ]
 SURVEY_COLUMN_INDEX = {key: index for index, (key, _title) in enumerate(SURVEY_COLUMNS)}
 SURVEY_HEADERS = [title for _key, title in SURVEY_COLUMNS]
-LICENSE_HEADERS = [
-    "Номер ліцензії", "Статус", "ПІБ", "Школа", "Клас", "Нік",
-    "Тип ліцензії", "Видано", "Дійсна до", "Оновлено",
-]
 
 _gsheet = None
-_license_registry = None
 
 def get_sheet():
     """Повертає повний лист анкети; старий перший лист лишається архівом."""
@@ -355,73 +351,12 @@ def get_sheet():
             _gsheet = False
     return _gsheet
 
-def get_license_registry():
-    """Повертає окремий, безпечний для верифікації реєстр ліцензій."""
-    global _license_registry
-    if _license_registry is not None:
-        return _license_registry
-
-    survey_sheet = get_sheet()
-    if not survey_sheet:
-        return False
-    try:
-        spreadsheet = survey_sheet.spreadsheet
-        try:
-            registry = spreadsheet.worksheet(LICENSE_REGISTRY_TITLE)
-        except gspread.WorksheetNotFound:
-            registry = spreadsheet.add_worksheet(
-                title=LICENSE_REGISTRY_TITLE, rows=1000, cols=len(LICENSE_HEADERS)
-            )
-
-        if not registry.get_all_values():
-            registry.append_row(LICENSE_HEADERS)
-            registry.freeze(rows=1)
-        _license_registry = registry
-    except Exception as e:
-        logging.error(f"Не вдалося підключити реєстр ліцензій: {e}")
-        _license_registry = False
-    return _license_registry
-
 def add_one_year(date_value: datetime.date) -> datetime.date:
     """Безпечно додає рік, зокрема для 29 лютого."""
     try:
         return date_value.replace(year=date_value.year + 1)
     except ValueError:
         return date_value.replace(year=date_value.year + 1, month=2, day=28)
-
-def upsert_license_record(answers: dict, passport_number: str) -> bool:
-    """Зберігає лише дані, які дозволено показувати під час QR-перевірки."""
-    registry = get_license_registry()
-    if not registry:
-        return False
-
-    issued = datetime.date.today()
-    valid_until = add_one_year(issued)
-    school_raw = answers.get("school_name", "—")
-    school = f"ШКОЛА № {school_raw}" if school_raw.strip().isdigit() else school_raw
-    record = [
-        passport_number,
-        "Дійсна",
-        answers.get("contact_name", "—"),
-        school,
-        str(answers.get("grade", "—")),
-        answers.get("nickname", "—"),
-        "Гравець",
-        issued.strftime("%d.%m.%Y"),
-        valid_until.strftime("%d.%m.%Y"),
-        datetime.datetime.now().strftime("%d.%m.%Y %H:%M"),
-    ]
-    try:
-        rows = registry.get_all_values()
-        for row_index, row in enumerate(rows[1:], start=2):
-            if row and row[0] == passport_number:
-                registry.update(f"A{row_index}:J{row_index}", [record])
-                return True
-        registry.append_row(record)
-        return True
-    except Exception as e:
-        logging.error(f"Не вдалося записати ліцензію в реєстр: {e}")
-        return False
 
 def make_verification_url(bot_username: str, passport_number: str) -> str:
     """Формує Telegram deep-link для безпечної перевірки однієї ліцензії."""
@@ -432,127 +367,145 @@ def make_verification_url(bot_username: str, passport_number: str) -> str:
 
 async def verify_license(update: Update, passport_number: str):
     """Показує тільки безпечні дані конкретної ліцензії, а не анкету."""
-    registry = get_license_registry()
-    if not registry:
+    if db_pool is None:
         await update.message.reply_text("⚠️ Реєстр тимчасово недоступний. Спробуйте пізніше.")
         return ConversationHandler.END
     try:
-        rows = registry.get_all_values()
-    except Exception:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT status, full_name, school, grade, issued_at, valid_until
+                   FROM licenses WHERE passport_number = $1""",
+                passport_number
+            )
+    except Exception as e:
+        logging.error(f"Помилка перевірки ліцензії: {e}")
         await update.message.reply_text("⚠️ Не вдалося перевірити ліцензію. Спробуйте пізніше.")
         return ConversationHandler.END
 
-    for row in rows[1:]:
-        if row and row[0] == passport_number:
-            values = (row + [""] * len(LICENSE_HEADERS))[:len(LICENSE_HEADERS)]
-            number, status, full_name, school, grade, nick, license_type, issued, valid_until, _updated = values
-            try:
-                is_active = status == "Дійсна" and datetime.datetime.strptime(valid_until, "%d.%m.%Y").date() >= datetime.date.today()
-            except ValueError:
-                is_active = False
-            if is_active:
-                await update.message.reply_text(
-                    "✅ *Ліцензія дійсна*\n\n"
-                    f"№ {number}\n{full_name}\n{school}, {grade} клас\n"
-                    f"Тип: {license_type}\nВидано: {issued}\nДійсна до: {valid_until}",
-                    parse_mode="Markdown",
-                )
-            else:
-                await update.message.reply_text(
-                    f"⛔ *Ліцензія недійсна*\n\n№ {number}", parse_mode="Markdown"
-                )
-            return ConversationHandler.END
+    if row is None:
+        await update.message.reply_text("⛔ Ліцензію з таким номером не знайдено.")
+        return ConversationHandler.END
 
-    await update.message.reply_text("⛔ Ліцензію з таким номером не знайдено.")
+    is_active = row["status"] == "active" and row["valid_until"] >= datetime.date.today()
+    if is_active:
+        await update.message.reply_text(
+            "✅ *Ліцензія дійсна*\n\n"
+            f"№ {passport_number}\n{row['full_name']}\n{row['school']}, {row['grade']} клас\n"
+            f"Видано: {row['issued_at'].strftime('%d.%m.%Y')}\n"
+            f"Дійсна до: {row['valid_until'].strftime('%d.%m.%Y')}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"⛔ *Ліцензія недійсна*\n\n№ {passport_number}", parse_mode="Markdown"
+        )
     return ConversationHandler.END
 
 DOCUMENT_NUMBER_RE = re.compile(r"^([A-Z]{2})-(\d{2})-(\d{2})-(\d{4})$")
 DOCUMENTS_PER_BLOCK = 9_999
 BLOCKS_PER_SERIES = 100
 DOCUMENTS_PER_SERIES = BLOCKS_PER_SERIES * DOCUMENTS_PER_BLOCK
-DOCUMENT_ISSUE_LOCK = asyncio.Lock()
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+LICENSE_PEPPER = os.environ.get("LICENSE_PEPPER", "")
+db_pool = None  # ініціалізується при старті бота (post_init)
 
 def _series_for_index(index: int) -> str:
     """0 → AA, 1 → AB, ... 25 → AZ, 26 → BA."""
     if index < 0:
-        raise ValueError("Індекс серії не може бути від’ємним")
+        raise ValueError("Індекс серії не може бути від'ємним")
     return f"{chr(65 + index // 26)}{chr(65 + index % 26)}"
 
-def _series_index(series: str) -> int:
-    """AA → 0, AB → 1, ... BA → 26."""
-    if len(series) != 2 or not series.isalpha() or not series.isupper():
-        raise ValueError(f"Некоректна серія документа: {series}")
-    return (ord(series[0]) - 65) * 26 + (ord(series[1]) - 65)
-
-def _parse_document_number(value: str):
-    """Повертає (серія, рік, блок, порядковий номер) або None для старих форматів."""
-    match = DOCUMENT_NUMBER_RE.fullmatch((value or "").strip())
-    if not match:
-        return None
-    series, year, block, serial = match.groups()
-    block_number = int(block)
-    serial_number = int(serial)
-    if not 0 <= block_number < BLOCKS_PER_SERIES or not 1 <= serial_number <= DOCUMENTS_PER_BLOCK:
-        return None
-    return series, int(year), block_number, serial_number
+def _decode_sequence(seq: int):
+    """Перетворює атомарний номер з license_sequence на (серія, блок, порядковий)."""
+    idx = seq - 1
+    series_index, series_offset = divmod(idx, DOCUMENTS_PER_SERIES)
+    block, serial_offset = divmod(series_offset, DOCUMENTS_PER_BLOCK)
+    return _series_for_index(series_index), block, serial_offset + 1
 
 def _normalise_identity(value: str) -> str:
     return " ".join((value or "").strip().casefold().split())
 
-def _same_participant(row: list[str], answers: dict) -> bool:
-    """Ідентифікація повторної видачі: ПІБ + дата народження."""
-    return (
-        len(row) > SURVEY_COLUMN_INDEX["birth_date"]
-        and _normalise_identity(row[SURVEY_COLUMN_INDEX["contact_name"]]) == _normalise_identity(answers.get("contact_name", ""))
-        and _normalise_identity(row[SURVEY_COLUMN_INDEX["birth_date"]]) == _normalise_identity(answers.get("birth_date", ""))
-    )
+def make_participant_key(answers: dict) -> str:
+    """Постійний, але незворотний ключ дитини для повторної видачі ліцензії."""
+    name = _normalise_identity(answers.get("contact_name", ""))
+    bdate = _normalise_identity(answers.get("birth_date", ""))
+    if not LICENSE_PEPPER:
+        raise RuntimeError("LICENSE_PEPPER не задано")
+    raw = f"{name}|{bdate}|{LICENSE_PEPPER}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
-def get_document_number(answers: dict, issue_year: int | None = None) -> str:
+async def init_db(app):
+    """Створює пул з'єднань з PostgreSQL при старті бота."""
+    global db_pool
+    if not DATABASE_URL:
+        logging.error("DATABASE_URL не задано — видача номерів працювати не буде")
+        return
+    if not LICENSE_PEPPER:
+        raise RuntimeError("LICENSE_PEPPER не задано — запуск зупинено з міркувань безпеки")
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    logging.info("✅ Підключення до PostgreSQL встановлено")
+
+async def close_db(app):
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+
+async def get_or_create_license(participant_key: str, answers: dict) -> str:
     """
-    Видає номер у форматі AA-26-00-0001.
+    Атомарно видає номер посвідчення у форматі AA-26-00-0001.
 
-    Нова людина одержує наступний вільний номер: AA-26-00-0001…AA-26-99-9999,
-    потім AB-26-00-0001 і так далі. Для повторного проходження тією самою
-    людиною зберігаються серія та порядковий номер; змінюється лише рік.
+    Нова дитина отримує наступний вільний номер через PostgreSQL SEQUENCE —
+    це гарантовано унікально, навіть якщо сотні запитів прийдуть одночасно.
+    Дитина, що вже проходила опитування раніше (той самий ПІБ + дата
+    народження), отримує ТОЙ САМИЙ номер — змінюється лише рік.
     """
-    year = (issue_year or datetime.date.today().year) % 100
-    sheet = get_sheet()
-    if not sheet:
-        raise RuntimeError("Неможливо видати паспорт без доступу до реєстру номерів")
+    if db_pool is None:
+        raise RuntimeError("Немає з'єднання з базою даних")
 
-    try:
-        all_rows = sheet.get_all_values()
-    except Exception as e:
-        raise RuntimeError("Неможливо прочитати реєстр номерів") from e
+    year = datetime.date.today().year % 100
+    issued = datetime.date.today()
+    valid_until = add_one_year(issued)
 
-    data_rows = all_rows[1:] if len(all_rows) > 1 else []
-
-    # Спочатку шукаємо попередню ліцензію цієї людини. Беремо найновіший рядок.
-    for row in reversed(data_rows):
-        if _same_participant(row, answers) and len(row) > SURVEY_COLUMN_INDEX["passport_number"]:
-            parsed = _parse_document_number(row[SURVEY_COLUMN_INDEX["passport_number"]])
-            if parsed:
-                series, _old_year, block, serial = parsed
-                return f"{series}-{year:02d}-{block:02d}-{serial:04d}"
-
-    # Для нового учасника наступний номер визначається за найбільшим уже
-    # виданим серійним номером незалежно від року — номери не повторюються.
-    largest_sequence = 0
-    for row in data_rows:
-        if len(row) <= SURVEY_COLUMN_INDEX["passport_number"]:
-            continue
-        parsed = _parse_document_number(row[SURVEY_COLUMN_INDEX["passport_number"]])
-        if parsed:
-            series, _doc_year, block, serial = parsed
-            largest_sequence = max(
-                largest_sequence,
-                _series_index(series) * DOCUMENTS_PER_SERIES + block * DOCUMENTS_PER_BLOCK + serial,
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            # Серіалізує лише повторні запити однієї людини. PostgreSQL sequence
+            # безпечно видає номери також при кількох процесах бота.
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", participant_key)
+            row = await conn.fetchrow(
+                "SELECT sequence_number FROM licenses WHERE participant_key = $1 FOR UPDATE",
+                participant_key
             )
+            if row is not None:
+                seq = row["sequence_number"]
+                series, block, serial = _decode_sequence(seq)
+                passport_number = f"{series}-{year:02d}-{block:02d}-{serial:04d}"
+                await conn.execute(
+                    """UPDATE licenses SET year=$1, issued_at=$2, valid_until=$3,
+                       status='active', updated_at=now(), full_name=$4, school=$5,
+                       grade=$6, nickname=$7, passport_number=$8
+                       WHERE participant_key=$9""",
+                    year, issued, valid_until, answers.get("contact_name", ""),
+                    answers.get("school_name", ""), str(answers.get("grade", "")),
+                    answers.get("nickname", ""), passport_number, participant_key
+                )
+                return passport_number
 
-    next_sequence = largest_sequence + 1
-    series_index, series_offset = divmod(next_sequence - 1, DOCUMENTS_PER_SERIES)
-    block, serial_offset = divmod(series_offset, DOCUMENTS_PER_BLOCK)
-    return f"{_series_for_index(series_index)}-{year:02d}-{block:02d}-{serial_offset + 1:04d}"
+            seq = await conn.fetchval("SELECT nextval('license_sequence')")
+            series, block, serial = _decode_sequence(seq)
+            passport_number = f"{series}-{year:02d}-{block:02d}-{serial:04d}"
+            await conn.execute(
+                """INSERT INTO licenses
+                   (participant_key, sequence_number, series, year, block, serial,
+                    passport_number, full_name, school, grade, nickname, status,
+                    issued_at, valid_until)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13)""",
+                participant_key, seq, series, year, block, serial,
+                passport_number, answers.get("contact_name", ""),
+                answers.get("school_name", ""), str(answers.get("grade", "")),
+                answers.get("nickname", ""), issued, valid_until
+            )
+            return passport_number
 
 def save_to_sheet(answers: dict):
     """Записує повний набір відповідей строго у порядку питань бота."""
@@ -1235,27 +1188,45 @@ async def future_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "future_role", update.message.text)
     d = ctx.user_data
 
-    # Паспорт гравця — видається одразу, без додаткових питань
-    try:
-        passport_data = dict(d)
-        tg_user = update.effective_user
-        if not passport_data.get("contact_name"):
-            passport_data["contact_name"] = f"{tg_user.first_name or ''} {tg_user.last_name or ''}".strip() or "Гравець"
-        passport_data["nickname"] = f"@{tg_user.username}" if tg_user.username else "—"
-        # Номер резервуємо у реєстрі до відправлення файлу. Це не дозволяє
-        # двом відповідям в одному процесі одержати однаковий номер.
-        async with DOCUMENT_ISSUE_LOCK:
-            passport_number = get_document_number(passport_data)
-            save(ctx, "passport_number", passport_number)
-            if not save_to_sheet(ctx.user_data):
-                raise RuntimeError("Не вдалося зберегти виданий номер у реєстрі")
-            if not upsert_license_record(passport_data, passport_number):
-                raise RuntimeError("Не вдалося зберегти ліцензію в реєстрі")
-            save(ctx, "response_saved", True)
+    tg_user = update.effective_user
+    if not d.get("contact_name"):
+        d["contact_name"] = f"{tg_user.first_name or ''} {tg_user.last_name or ''}".strip() or "Гравець"
+    d["nickname"] = f"@{tg_user.username}" if tg_user.username else "—"
 
+    # Номер видається атомарно через PostgreSQL — швидко, без блокування
+    # інших дітей, що завершують опитування одночасно.
+    try:
+        participant_key = make_participant_key(d)
+        passport_number = await get_or_create_license(participant_key, d)
+        save(ctx, "passport_number", passport_number)
+        save(ctx, "response_saved", True)
+    except Exception as e:
+        logger.error(f"Не вдалося видати номер ліцензії: {e}")
+        await update.message.reply_text(
+            "⚠️ Виникла технічна помилка при видачі паспорта. "
+            "Спробуй, будь ласка, ще раз трохи пізніше через команду /start."
+        )
+        return await _finish(update, ctx)
+
+    await update.message.reply_text("🎫 Ліцензію формуємо, зачекай кілька секунд...")
+
+    # Малювання картинки і запис у Google Таблицю — важкі операції, тому
+    # виконуються у фоні й НЕ блокують відповідь іншим дітям.
+    asyncio.create_task(_deliver_passport_and_log(update, ctx, dict(d), passport_number))
+
+    return await _finish(update, ctx)
+
+async def _deliver_passport_and_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                     passport_data: dict, passport_number: str):
+    """Фонова задача: генерує картинку паспорта і пише повний запис у Google Таблицю."""
+    loop = asyncio.get_running_loop()
+    try:
         bot_profile = await ctx.bot.get_me()
         verification_url = make_verification_url(bot_profile.username, passport_number)
-        photo_buf = generate_passport(passport_data, passport_number, verification_url)
+        # PIL-малювання — важка для процесора операція, виконуємо в окремому потоці
+        photo_buf = await loop.run_in_executor(
+            None, generate_passport, passport_data, passport_number, verification_url
+        )
         await update.message.reply_photo(
             photo=photo_buf,
             caption=f"🎫 *Твій паспорт гравця* {passport_number}\n\nЗбережи собі на телефон!",
@@ -1264,7 +1235,10 @@ async def future_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Не вдалося згенерувати паспорт: {e}")
 
-    return await _finish(update, ctx)
+    try:
+        await loop.run_in_executor(None, save_to_sheet, passport_data)
+    except Exception as e:
+        logger.error(f"Помилка запису у Google Sheets: {e}")
 
 # ── ФІНАЛ ──────────────────────────────────────────────────────────
 async def _finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1300,7 +1274,13 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── ЗАПУСК ─────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(init_db)
+        .post_shutdown(close_db)
+        .build()
+    )
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={

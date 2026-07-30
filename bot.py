@@ -368,8 +368,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
     TOXIC, RESPECT_RULE, SAFE_FEEL,
     CLUB_JOIN, CLUB_ROLE, CLUB_IMPORTANT, PARENTS_SUPPORT, PARENTS_ALLOW,
     FUTURE, FUTURE_ROLE,
-    TICKET, PARENT_NAME, CONTACT_PHONE, CONTACT_TIME,
-) = range(74)
+) = range(70)
 
 # ── ДАНІ ПРО ОБЛАСТІ: ЦЕНТРИ ТА ВЕЛИКІ МІСТА ────────────────────
 OBLAST_CENTERS = {
@@ -498,30 +497,7 @@ async def birth_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def region(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "region", update.message.text)
     await update.message.reply_text(
-        "*П5. В якому ти класі?*",
-        parse_mode="Markdown",
-        reply_markup=kb(["3","4","5","6","7","8","9","10","11"])
-    )
-    return GRADE
-
-async def grade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    save(ctx, "grade_number", update.message.text)
-    await update.message.reply_text(
-        "*П5б. Буква класу?*",
-        parse_mode="Markdown",
-        reply_markup=kb(["А","Б","В","Г","Немає букви"])
-    )
-    return GRADE_LETTER
-
-async def grade_letter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    letter = update.message.text
-    num = ctx.user_data.get("grade_number", "")
-    if letter and letter != "Немає букви":
-        save(ctx, "grade", f"{num}-{letter}")
-    else:
-        save(ctx, "grade", num)
-    await update.message.reply_text(
-        "*П6. Де ти живеш?*\n\n"
+        "*П5. Де ти живеш?*\n\n"
         "Напиши перші 3-4 літери назви свого міста, селища або села — "
         "бот покаже список схожих варіантів, і ти обереш потрібний.\n\n"
         "_Наприклад: «Бров» → покаже Бровари_",
@@ -610,7 +586,30 @@ async def school_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def school_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "school_name", update.message.text)
     await update.message.reply_text(
-        "🏃 *БЛОК: СПОРТ*\n\n*П8. Чи займаєшся спортом?*",
+        "*П9. В якому ти класі?*",
+        parse_mode="Markdown",
+        reply_markup=kb(["3","4","5","6","7","8","9","10","11"])
+    )
+    return GRADE
+
+async def grade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    save(ctx, "grade_number", update.message.text)
+    await update.message.reply_text(
+        "*П9б. Буква класу?*",
+        parse_mode="Markdown",
+        reply_markup=kb(["А","Б","В","Г","Немає букви"])
+    )
+    return GRADE_LETTER
+
+async def grade_letter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    letter = update.message.text
+    num = ctx.user_data.get("grade_number", "")
+    if letter and letter != "Немає букви":
+        save(ctx, "grade", f"{num}-{letter}")
+    else:
+        save(ctx, "grade", num)
+    await update.message.reply_text(
+        "🏃 *БЛОК: СПОРТ*\n\n*П10. Чи займаєшся спортом?*",
         parse_mode="Markdown",
         reply_markup=kb(["Так, регулярно","Так, іноді","Ні"])
     )
@@ -620,21 +619,21 @@ async def school_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def sport_active(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     val = update.message.text; save(ctx, "sport_active", val)
     if val == "Ні":
-        await update.message.reply_text("*П9б. Чому не займаєшся спортом?*", parse_mode="Markdown",
+        await update.message.reply_text("*П10б. Чому не займаєшся спортом?*", parse_mode="Markdown",
             reply_markup=kb(["Немає часу","Немає секції поруч","Не цікаво","Інша причина"]))
         return SPORT_WHY_NOT
-    await update.message.reply_text("*П9. Який вид спорту?*\n\nНапиши:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("*П10а. Який вид спорту?*\n\nНапиши:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     return SPORT_TYPE
 
 async def sport_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "sport_type", update.message.text)
-    await update.message.reply_text("*П10. Де займаєшся спортом?*", parse_mode="Markdown",
-        reply_markup=kb(["Шкільна секція","Спортивний клуб","Міські змагання","Обласні змагання","На вулиці"]))
+    await update.message.reply_text("*П11. Де займаєшся спортом?*", parse_mode="Markdown",
+        reply_markup=kb(["Шкільна секція","Спортивний клуб","На вулиці","Самостійно"]))
     return SPORT_LEVEL
 
 async def sport_level(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "sport_level", update.message.text)
-    await update.message.reply_text("*П11. Чи є тренер або наставник?*", parse_mode="Markdown", reply_markup=kb(["Так","Ні"]))
+    await update.message.reply_text("*П12. Чи є тренер або наставник?*", parse_mode="Markdown", reply_markup=kb(["Так","Ні"]))
     return SPORT_COACH
 
 async def sport_coach(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -644,7 +643,7 @@ async def sport_coach(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def sport_why_not(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "sport_why_not", update.message.text)
-    await update.message.reply_text("*П9в. Хотів би займатись спортом?*", parse_mode="Markdown",
+    await update.message.reply_text("*П10в. Хотів би займатись спортом?*", parse_mode="Markdown",
         reply_markup=kb(["Так","Можливо","Ні"]))
     return SPORT_WOULD_LIKE
 
@@ -654,14 +653,14 @@ async def sport_would_like(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return WATCH_SPORT
 
 async def _ask_watch_sport(update):
-    await update.message.reply_text("*П12. Чи дивишся спортивні трансляції?*", parse_mode="Markdown",
+    await update.message.reply_text("*П13. Чи дивишся спортивні трансляції?*", parse_mode="Markdown",
         reply_markup=kb(["Так, часто","Іноді","Ні"]))
 
 async def watch_sport(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     val = update.message.text; save(ctx, "watch_sport", val)
     if val == "Ні":
         await _ask_phys_ed(update); return PHYS_ED
-    await update.message.reply_text("*П13. Де дивишся трансляції?*", parse_mode="Markdown",
+    await update.message.reply_text("*П13а. Де дивишся трансляції?*", parse_mode="Markdown",
         reply_markup=kb(["YouTube","Twitch","Телебачення","Кілька платформ"]))
     return WATCH_WHERE
 
@@ -998,10 +997,10 @@ async def future(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def future_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save(ctx, "future_role", update.message.text)
+    d = ctx.user_data
 
-    # Паспорт гравця — одразу після завершення основної анкети, як подарунок
+    # Паспорт гравця — видається одразу, без додаткових питань
     try:
-        d = ctx.user_data
         passport_data = dict(d)
         tg_user = update.effective_user
         if not passport_data.get("contact_name"):
@@ -1018,52 +1017,27 @@ async def future_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Не вдалося згенерувати паспорт: {e}")
 
-    await update.message.reply_text(SUPPORT_TEXT, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-    await update.message.reply_text(
-        "*П62. Хочеш отримати квиток до кіберспортивного клубу або на найближчу подію?*",
-        parse_mode="Markdown", reply_markup=kb(["🎟 Так, хочу квиток!","Ні, дякую"]))
-    return TICKET
-
-# ── ФІНАЛ ──────────────────────────────────────────────────────────
-async def ticket(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text; save(ctx, "ticket", val)
-    if val.startswith("Ні"): return await _finish(update, ctx)
-    await update.message.reply_text("*Як звати одного з батьків?* (для зв'язку)\n\nНапиши ім'я та прізвище:",
-        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
-    return PARENT_NAME
-
-async def parent_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    save(ctx, "parent_name", update.message.text)
-    await update.message.reply_text("*Телефон батьків для зв'язку:*\n\nНаприклад: +380991234567", parse_mode="Markdown")
-    return CONTACT_PHONE
-
-async def contact_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    save(ctx, "contact_phone", update.message.text)
-    await update.message.reply_text("*Зручний час для зв'язку?*", parse_mode="Markdown",
-        reply_markup=kb(["Вранці (до 12:00)","Вдень (12–17)","Ввечері (17–20)"]))
-    return CONTACT_TIME
-
-async def contact_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    save(ctx, "contact_time", update.message.text)
     return await _finish(update, ctx)
 
+# ── ФІНАЛ ──────────────────────────────────────────────────────────
 async def _finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = ctx.user_data
-    club = d.get("club_join","")
-    has_ticket = d.get("ticket","").startswith("🎟")
+    club = d.get("club_join", "")
 
-    if has_ticket:
-        msg = "🎟️ *Квиток оформлюється!*\n\nОчікуй дзвінка від організаторів. До зустрічі в клубі!"
-    elif club == "Так, одразу!":
-        msg = "🏆 *Ти — саме та людина, заради якої ми відкриваємо клуб!*\n\nЧекаємо тебе на першому тренуванні!"
+    if club == "Так, одразу!":
+        club_msg = "🏆 Ти — саме та людина, заради якої ми відкриваємо клуб! Чекаємо тебе на першому тренуванні!"
     elif club == "Можливо":
-        msg = "😊 *Сподіваємось, що ти заглянеш до клубу* і знайдеш щось цікаве для себе!"
+        club_msg = "😊 Сподіваємось, що ти заглянеш до клубу і знайдеш щось цікаве для себе!"
     else:
-        msg = "👍 *Дякуємо за участь!*\n\nЯкщо колись зміниш думку — двері клубу завжди відкриті."
+        club_msg = "Якщо колись зміниш думку — двері клубу завжди відкриті."
 
     await update.message.reply_text(
-        f"✅ *Опитування завершено!*\n\n{msg}\n\n"
-        "💙 Пам'ятай: якщо потрібна допомога — *116 111* (безкоштовно, анонімно)",
+        "✅ *Дякуємо, що ти з нами!*\n\n"
+        f"{club_msg}\n\n"
+        "💙 *Якщо виникли питання — телефонуй:*\n"
+        "📞 116 111 — безкоштовно з мобільного\n"
+        "📞 0 800 500 225 — безкоштовно\n\n"
+        "_Анонімно · конфіденційно · цілодобово_",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
 
@@ -1152,10 +1126,6 @@ def main():
             PARENTS_ALLOW:[MessageHandler(filters.TEXT&~filters.COMMAND,parents_allow)],
             FUTURE:[MessageHandler(filters.TEXT&~filters.COMMAND,future)],
             FUTURE_ROLE:[MessageHandler(filters.TEXT&~filters.COMMAND,future_role)],
-            TICKET:[MessageHandler(filters.TEXT&~filters.COMMAND,ticket)],
-            PARENT_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,parent_name)],
-            CONTACT_PHONE:[MessageHandler(filters.TEXT&~filters.COMMAND,contact_phone)],
-            CONTACT_TIME:[MessageHandler(filters.TEXT&~filters.COMMAND,contact_time)],
         },
         fallbacks=[CommandHandler("cancel",cancel)],
         allow_reentry=True

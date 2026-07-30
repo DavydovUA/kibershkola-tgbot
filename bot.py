@@ -197,7 +197,8 @@ def generate_passport(answers: dict, passport_number: str, verification_url: str
     draw.text((col_x, 500), str(grade), font=font(19), fill=NAVY)
 
     # ── Дати: Видано / Дійсна до ──
-    valid_until = add_one_year(datetime.date.today())
+    issued = datetime.date.today()
+    valid_until = add_one_year(issued)
     date_font = font(15)
     draw.text((65, 542), issued.strftime("%d.%m.%Y"), font=date_font, fill=NAVY)
     draw.text((208, 542), valid_until.strftime("%d.%m.%Y"), font=date_font, fill=NAVY)
@@ -442,7 +443,11 @@ async def init_db(app):
         return
     if not LICENSE_PEPPER:
         raise RuntimeError("LICENSE_PEPPER не задано — запуск зупинено з міркувань безпеки")
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    # statement_cache_size=0 — обов'язково для Supabase Transaction Pooler (PgBouncer).
+    # Пулер перемикає фізичні з'єднання між транзакціями, а asyncpg за замовчуванням
+    # кешує підготовлені запити на конкретному з'єднанні — це несумісно і викликає
+    # помилку "prepared statement already exists".
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, statement_cache_size=0)
     logging.info("✅ Підключення до PostgreSQL встановлено")
 
 async def close_db(app):
@@ -463,7 +468,8 @@ async def get_or_create_license(participant_key: str, answers: dict) -> str:
         raise RuntimeError("Немає з'єднання з базою даних")
 
     year = datetime.date.today().year % 100
-    valid_until = add_one_year(datetime.date.today())
+    issued = datetime.date.today()
+    valid_until = add_one_year(issued)
 
     async with db_pool.acquire() as conn:
         async with conn.transaction():
@@ -479,16 +485,13 @@ async def get_or_create_license(participant_key: str, answers: dict) -> str:
                 series, block, serial = _decode_sequence(seq)
                 passport_number = f"{series}-{year:02d}-{block:02d}-{serial:04d}"
                 await conn.execute(
-                    """UPDATE licenses SET
-                           series=$1, year=$2, block=$3, serial=$4,
-                           passport_number=$5, full_name=$6, school=$7,
-                           grade=$8, nickname=$9, valid_until=$10,
-                           updated_at=now()
-                       WHERE participant_key=$11""",
-                    series, str(year), str(block), str(serial), passport_number,
-                    answers.get("contact_name", ""), answers.get("school_name", ""),
-                    str(answers.get("grade", "")), answers.get("nickname", ""),
-                    valid_until, participant_key
+                    """UPDATE licenses SET year=$1, issued_at=$2, valid_until=$3,
+                       status='active', updated_at=now(), full_name=$4, school=$5,
+                       grade=$6, nickname=$7, passport_number=$8
+                       WHERE participant_key=$9""",
+                    str(year), issued, valid_until, answers.get("contact_name", ""),
+                    answers.get("school_name", ""), str(answers.get("grade", "")),
+                    answers.get("nickname", ""), passport_number, participant_key
                 )
                 return passport_number
 
@@ -498,12 +501,13 @@ async def get_or_create_license(participant_key: str, answers: dict) -> str:
             await conn.execute(
                 """INSERT INTO licenses
                    (participant_key, sequence_number, series, year, block, serial,
-                    passport_number, full_name, school, grade, nickname, valid_until)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)""",
+                    passport_number, full_name, school, grade, nickname, status,
+                    issued_at, valid_until)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13)""",
                 participant_key, seq, series, str(year), str(block), str(serial),
                 passport_number, answers.get("contact_name", ""),
                 answers.get("school_name", ""), str(answers.get("grade", "")),
-                answers.get("nickname", ""), valid_until
+                answers.get("nickname", ""), issued, valid_until
             )
             return passport_number
 
@@ -1287,6 +1291,7 @@ def main():
         .token(TOKEN)
         .post_init(init_db)
         .post_shutdown(close_db)
+        .concurrent_updates(True)  # обробляти різних дітей паралельно, а не по черзі
         .build()
     )
     app.add_handler(CommandHandler("myid", myid))

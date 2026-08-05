@@ -5,11 +5,15 @@ import asyncio
 import re
 import hashlib
 import json
+import base64
+import hmac
+import secrets
+from urllib.parse import urlencode
 import httpx
 import asyncpg
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, WebAppInfo
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    AIORateLimiter, Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
 )
 
@@ -545,6 +549,22 @@ def save_to_sheet(answers: dict):
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# PIL та синхронний запис у Google Sheets виконуються у фонових потоках.
+# Явні семафори не дозволяють великій кількості одночасних анкет
+# безконтрольно зайняти executor і пам'ять процесу.
+PASSPORT_GENERATION_CONCURRENCY = 2
+SHEET_WRITE_CONCURRENCY = 2
+passport_generation_semaphore = asyncio.Semaphore(PASSPORT_GENERATION_CONCURRENCY)
+sheet_write_semaphore = asyncio.Semaphore(SHEET_WRITE_CONCURRENCY)
+background_tasks = set()
+
+def spawn_background(coro):
+    """Запускає фонову задачу й утримує посилання до її завершення."""
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
 TOKEN = os.environ.get("BOT_TOKEN")
 MINI_APP_URL = os.environ.get("MINI_APP_URL", "https://app.eschool.gg").strip().rstrip("/")
 MINIAPP_INTERNAL_TOKEN = os.environ.get("MINIAPP_INTERNAL_TOKEN", "").strip()
@@ -635,6 +655,29 @@ def grade_int(ctx):
     digits = "".join(ch for ch in raw if ch.isdigit())
     return int(digits) if digits else 0
 
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+def create_miniapp_launch_token(user_id: int) -> str:
+    """Короткоживучий підписаний пропуск для запуску через KeyboardButton."""
+    if not MINIAPP_INTERNAL_TOKEN:
+        raise RuntimeError("MINIAPP_INTERNAL_TOKEN не налаштований")
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    payload = {
+        "uid": str(user_id),
+        "exp": now + 2 * 60 * 60,
+        "nonce": secrets.token_hex(8),
+    }
+    payload_b64 = _b64url(json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8"))
+    signature = hmac.new(
+        MINIAPP_INTERNAL_TOKEN.encode("utf-8"),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{payload_b64}.{_b64url(signature)}"
+
 # ── СТАРТ ──────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Головний вхід: перевірка QR або запуск Telegram Mini App."""
@@ -646,13 +689,22 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     ctx.user_data.clear()
+    try:
+        launch_token = create_miniapp_launch_token(update.effective_user.id)
+    except RuntimeError:
+        logger.exception("Mini App launch token is not configured")
+        await update.message.reply_text(
+            "⚠️ Анкета тимчасово недоступна. Повідом адміністратора бота."
+        )
+        return ConversationHandler.END
+    launch_url = f"{MINI_APP_URL}/?{urlencode({'launch': launch_token})}"
     await update.message.reply_text(
         "👋 *Привіт!*\n\n"
         "Відкрий офіційну анкету ESUL Underground. Вона збереже прогрес "
         "після кожного блоку, а після завершення бот сформує паспорт спортсмена.",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup(
-            [[KeyboardButton("🚀 Розпочни свій шлях", web_app=WebAppInfo(url=MINI_APP_URL))]],
+            [[KeyboardButton("🚀 Розпочни свій шлях", web_app=WebAppInfo(url=launch_url))]],
             resize_keyboard=True,
             one_time_keyboard=False,
             is_persistent=True,
@@ -757,7 +809,7 @@ async def web_app_submission(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🎫 Анкету отримано. Ліцензію формуємо, зачекай кілька секунд…",
             reply_markup=ReplyKeyboardRemove(),
         )
-        asyncio.create_task(
+        spawn_background(
             _deliver_passport_and_log(update, ctx, dict(answers), passport_number)
         )
         return await _finish(update, ctx)
@@ -1348,7 +1400,7 @@ async def future_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Малювання картинки і запис у Google Таблицю — важкі операції, тому
     # виконуються у фоні й НЕ блокують відповідь іншим дітям.
-    asyncio.create_task(_deliver_passport_and_log(update, ctx, dict(d), passport_number))
+    spawn_background(_deliver_passport_and_log(update, ctx, dict(d), passport_number))
 
     return await _finish(update, ctx)
 
@@ -1360,9 +1412,10 @@ async def _deliver_passport_and_log(update: Update, ctx: ContextTypes.DEFAULT_TY
         bot_profile = await ctx.bot.get_me()
         verification_url = make_verification_url(bot_profile.username, passport_number)
         # PIL-малювання — важка для процесора операція, виконуємо в окремому потоці
-        photo_buf = await loop.run_in_executor(
-            None, generate_passport, passport_data, passport_number, verification_url
-        )
+        async with passport_generation_semaphore:
+            photo_buf = await loop.run_in_executor(
+                None, generate_passport, passport_data, passport_number, verification_url
+            )
         await update.message.reply_photo(
             photo=photo_buf,
             caption=f"🎫 *Твій паспорт гравця* {passport_number}\n\nЗбережи собі на телефон!",
@@ -1372,7 +1425,8 @@ async def _deliver_passport_and_log(update: Update, ctx: ContextTypes.DEFAULT_TY
         logger.error(f"Не вдалося згенерувати паспорт: {e}")
 
     try:
-        await loop.run_in_executor(None, save_to_sheet, passport_data)
+        async with sheet_write_semaphore:
+            await loop.run_in_executor(None, save_to_sheet, passport_data)
     except Exception as e:
         logger.error(f"Помилка запису у Google Sheets: {e}")
 
@@ -1398,9 +1452,19 @@ async def _finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
 
-    logger.info(f"DONE uid={update.effective_user.id} data={d}")
+    logger.info(
+        "DONE uid=%s passport=%s response_saved=%s",
+        update.effective_user.id,
+        d.get("passport_number", "none"),
+        bool(d.get("response_saved")),
+    )
     if not d.get("response_saved"):
-        save_to_sheet(d)
+        loop = asyncio.get_running_loop()
+        try:
+            async with sheet_write_semaphore:
+                await loop.run_in_executor(None, save_to_sheet, dict(d))
+        except Exception as error:
+            logger.error("Помилка резервного запису у Google Sheets: %s", error)
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1413,6 +1477,7 @@ def main():
     app = (
         Application.builder()
         .token(TOKEN)
+        .rate_limiter(AIORateLimiter(max_retries=3))
         .concurrent_updates(True)
         .post_init(init_db)
         .post_shutdown(close_db)
@@ -1498,8 +1563,7 @@ def main():
         fallbacks=[CommandHandler("cancel",cancel)],
         allow_reentry=True
     )
-    # Legacy text survey is intentionally not registered. The Telegram Mini App
-    # opened from /start is the only supported registration path.
+    app.add_handler(conv)
     print("✅ Бот запущено! Натисни Ctrl+C для зупинки.")
     app.run_polling(drop_pending_updates=True)
 

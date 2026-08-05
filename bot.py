@@ -4,9 +4,10 @@ import datetime
 import asyncio
 import re
 import hashlib
+import json
 import httpx
 import asyncpg
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, WebAppInfo
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
@@ -313,6 +314,7 @@ SURVEY_COLUMNS = [
     ("parents_allow", "П62. Дозвіл на тренування після уроків"),
     ("future", "П63. Бажання пов’язати майбутнє з кіберспортом"),
     ("future_role", "П64. Бажана майбутня професія"),
+    ("safety_answer", "П65. Питання про безпеку та підтримку"),
 ]
 SURVEY_COLUMN_INDEX = {key: index for index, (key, _title) in enumerate(SURVEY_COLUMNS)}
 SURVEY_HEADERS = [title for _key, title in SURVEY_COLUMNS]
@@ -346,6 +348,13 @@ def get_sheet():
                 )
                 _gsheet.append_row(SURVEY_HEADERS)
                 _gsheet.freeze(rows=1)
+            else:
+                # Не змінюємо попередні відповіді. Якщо після оновлення анкети
+                # з'явилися нові поля, дописуємо лише відсутні заголовки справа.
+                existing_headers = _gsheet.row_values(1)
+                for column_index, header in enumerate(SURVEY_HEADERS, start=1):
+                    if column_index > len(existing_headers):
+                        _gsheet.update_cell(1, column_index, header)
         except Exception as e:
             logging.error(f"Не вдалося підключитись до Google Sheets: {e}")
             _gsheet = False
@@ -443,11 +452,12 @@ async def init_db(app):
         return
     if not LICENSE_PEPPER:
         raise RuntimeError("LICENSE_PEPPER не задано — запуск зупинено з міркувань безпеки")
-    # statement_cache_size=0 — обов'язково для Supabase Transaction Pooler (PgBouncer).
-    # Пулер перемикає фізичні з'єднання між транзакціями, а asyncpg за замовчуванням
-    # кешує підготовлені запити на конкретному з'єднанні — це несумісно і викликає
-    # помилку "prepared statement already exists".
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, statement_cache_size=0)
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=10,
+        statement_cache_size=0,
+    )
     logging.info("✅ Підключення до PostgreSQL встановлено")
 
 async def close_db(app):
@@ -468,8 +478,7 @@ async def get_or_create_license(participant_key: str, answers: dict) -> str:
         raise RuntimeError("Немає з'єднання з базою даних")
 
     year = datetime.date.today().year % 100
-    issued = datetime.date.today()
-    valid_until = add_one_year(issued)
+    valid_until = add_one_year(datetime.date.today())
 
     async with db_pool.acquire() as conn:
         async with conn.transaction():
@@ -485,13 +494,17 @@ async def get_or_create_license(participant_key: str, answers: dict) -> str:
                 series, block, serial = _decode_sequence(seq)
                 passport_number = f"{series}-{year:02d}-{block:02d}-{serial:04d}"
                 await conn.execute(
-                    """UPDATE licenses SET year=$1, issued_at=$2, valid_until=$3,
-                       status='active', updated_at=now(), full_name=$4, school=$5,
-                       grade=$6, nickname=$7, passport_number=$8
-                       WHERE participant_key=$9""",
-                    str(year), issued, valid_until, answers.get("contact_name", ""),
-                    answers.get("school_name", ""), str(answers.get("grade", "")),
-                    answers.get("nickname", ""), passport_number, participant_key
+                    """UPDATE licenses SET
+                           series=$1, year=$2, block=$3, serial=$4,
+                           passport_number=$5, full_name=$6, school=$7,
+                           grade=$8, nickname=$9, status='active',
+                           issued_at=$10, valid_until=$11,
+                           updated_at=now()
+                       WHERE participant_key=$12""",
+                    series, year, block, serial, passport_number,
+                    answers.get("contact_name", ""), answers.get("school_name", ""),
+                    str(answers.get("grade", "")), answers.get("nickname", ""),
+                    datetime.date.today(), valid_until, participant_key
                 )
                 return passport_number
 
@@ -501,13 +514,13 @@ async def get_or_create_license(participant_key: str, answers: dict) -> str:
             await conn.execute(
                 """INSERT INTO licenses
                    (participant_key, sequence_number, series, year, block, serial,
-                    passport_number, full_name, school, grade, nickname, status,
-                    issued_at, valid_until)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13)""",
-                participant_key, seq, series, str(year), str(block), str(serial),
+                    passport_number, full_name, school, grade, nickname,
+                    status, issued_at, valid_until)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)""",
+                participant_key, seq, series, year, block, serial,
                 passport_number, answers.get("contact_name", ""),
                 answers.get("school_name", ""), str(answers.get("grade", "")),
-                answers.get("nickname", ""), issued, valid_until
+                answers.get("nickname", ""), "active", datetime.date.today(), valid_until
             )
             return passport_number
 
@@ -533,6 +546,13 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN")
+MINI_APP_URL = os.environ.get("MINI_APP_URL", "https://app.eschool.gg").strip().rstrip("/")
+MINIAPP_INTERNAL_TOKEN = os.environ.get("MINIAPP_INTERNAL_TOKEN", "").strip()
+ALERT_CHAT_IDS = [
+    int(value.strip())
+    for value in os.environ.get("ALERT_CHAT_IDS", "").split(",")
+    if value.strip().lstrip("-").isdigit()
+]
 
 (
     CONSENT, GENDER, REGION, FULL_NAME, BIRTH_DATE, GRADE, GRADE_LETTER,
@@ -617,6 +637,30 @@ def grade_int(ctx):
 
 # ── СТАРТ ──────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Головний вхід: перевірка QR або запуск Telegram Mini App."""
+    if ctx.args and ctx.args[0].startswith("verify_"):
+        passport_number = ctx.args[0][len("verify_"):].upper()
+        if DOCUMENT_NUMBER_RE.fullmatch(passport_number):
+            return await verify_license(update, passport_number)
+        await update.message.reply_text("⛔ Некоректний номер ліцензії.")
+        return ConversationHandler.END
+
+    ctx.user_data.clear()
+    await update.message.reply_text(
+        "👋 *Привіт!*\n\n"
+        "Відкрий офіційну анкету ESUL Underground. Вона збереже прогрес "
+        "після кожного блоку, а після завершення бот сформує паспорт спортсмена.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(
+            [[KeyboardButton("🚀 Розпочни свій шлях", web_app=WebAppInfo(url=MINI_APP_URL))]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
+    return ConversationHandler.END
+
+async def legacy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Резервна стара анкета у чаті, доступна через /legacy."""
     # QR відкриває бота з параметром verify_AA-26-00-0001.
     if ctx.args and ctx.args[0].startswith("verify_"):
         passport_number = ctx.args[0][len("verify_"):].upper()
@@ -644,6 +688,84 @@ async def myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Надішліть це число адміністратору бота.",
         parse_mode="Markdown"
     )
+
+async def web_app_submission(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Забирає завершену Mini App-анкету та запускає видачу паспорта."""
+    try:
+        if not MINIAPP_INTERNAL_TOKEN:
+            raise RuntimeError("MINIAPP_INTERNAL_TOKEN не налаштований")
+
+        payload = json.loads(update.message.web_app_data.data)
+        submission_id = str(payload.get("submissionId", ""))
+        if payload.get("type") != "survey_complete" or not re.fullmatch(
+            r"[0-9a-fA-F-]{36}", submission_id
+        ):
+            raise ValueError("Некоректний ідентифікатор анкети")
+
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.get(
+                f"{MINI_APP_URL}/api/submissions/{submission_id}",
+                headers={"X-Internal-Token": MINIAPP_INTERNAL_TOKEN},
+            )
+            response.raise_for_status()
+            record = response.json()
+
+        record_user_id = record.get("telegramUserId")
+        current_user_id = str(update.effective_user.id)
+        if not record_user_id or str(record_user_id) != current_user_id:
+            raise ValueError("Анкета належить іншому користувачу")
+
+        answers = record.get("answers")
+        if not isinstance(answers, dict) or answers.get("parental_consent") != "Надано":
+            raise ValueError("Анкета не завершена")
+
+        grade_number = str(answers.get("grade_number", ""))
+        grade_letter = str(answers.get("grade_letter", ""))
+        answers["grade"] = (
+            f"{grade_number}-{grade_letter}"
+            if grade_letter and grade_letter != "Немає букви"
+            else grade_number
+        )
+        answers["nickname"] = (
+            f"@{update.effective_user.username}"
+            if update.effective_user.username
+            else "—"
+        )
+
+        participant_key = make_participant_key(answers)
+        passport_number = await get_or_create_license(participant_key, answers)
+        answers["passport_number"] = passport_number
+        answers["response_saved"] = True
+        ctx.user_data.clear()
+        ctx.user_data.update(answers)
+
+        if answers.get("safety_answer") != "Ні, такого не було":
+            alert_text = (
+                "⚠️ *Обратить внимание*\n"
+                "Получен ответ, требующий проверки.\n"
+                f"Код лицензии: `{passport_number}`"
+            )
+            for chat_id in ALERT_CHAT_IDS:
+                try:
+                    await ctx.bot.send_message(chat_id, alert_text, parse_mode="Markdown")
+                except Exception as alert_error:
+                    logger.error(f"Не вдалося надіслати службове сповіщення: {alert_error}")
+
+        await update.message.reply_text(
+            "🎫 Анкету отримано. Ліцензію формуємо, зачекай кілька секунд…",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        asyncio.create_task(
+            _deliver_passport_and_log(update, ctx, dict(answers), passport_number)
+        )
+        return await _finish(update, ctx)
+    except Exception as error:
+        logger.exception(f"Помилка обробки Mini App анкети: {error}")
+        await update.message.reply_text(
+            "⚠️ Анкету збережено, але паспорт поки не вдалося сформувати. "
+            "Адміністратор зможе повторити видачу без повторного проходження анкети."
+        )
+        return ConversationHandler.END
 
 async def consent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text.startswith("❌"):
@@ -1289,14 +1411,16 @@ def main():
     app = (
         Application.builder()
         .token(TOKEN)
+        .concurrent_updates(True)
         .post_init(init_db)
         .post_shutdown(close_db)
-        .concurrent_updates(True)  # обробляти різних дітей паралельно, а не по черзі
         .build()
     )
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, web_app_submission), group=-1)
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler("legacy", legacy_start)],
         states={
             CONSENT:[MessageHandler(filters.TEXT&~filters.COMMAND,consent)],
             GENDER:[MessageHandler(filters.TEXT&~filters.COMMAND,gender)],
@@ -1372,7 +1496,8 @@ def main():
         fallbacks=[CommandHandler("cancel",cancel)],
         allow_reentry=True
     )
-    app.add_handler(conv)
+    # Legacy text survey is intentionally not registered. The Telegram Mini App
+    # opened from /start is the only supported registration path.
     print("✅ Бот запущено! Натисни Ctrl+C для зупинки.")
     app.run_polling(drop_pending_updates=True)
 

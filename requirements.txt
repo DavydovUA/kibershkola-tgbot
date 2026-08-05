@@ -6,3 +6,4 @@ python-barcode==0.15.1
 httpx==0.25.2
 qrcode==7.4.2
 asyncpg==0.29.0
+aiolimiter>=1.1,<2.0

@@ -654,7 +654,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("🚀 Розпочни свій шлях", web_app=WebAppInfo(url=MINI_APP_URL))]],
             resize_keyboard=True,
-            one_time_keyboard=True,
+            one_time_keyboard=False,
+            is_persistent=True,
+            input_field_placeholder="Натисни кнопку нижче",
         ),
     )
     return ConversationHandler.END
